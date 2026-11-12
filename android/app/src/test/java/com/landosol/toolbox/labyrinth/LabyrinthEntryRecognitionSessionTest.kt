@@ -4,6 +4,7 @@ import com.landosol.toolbox.automation.AutomationSessionManager
 import com.landosol.toolbox.automation.AutomationMode
 import com.landosol.toolbox.automation.AutomationBackendResult
 import com.landosol.toolbox.automation.SessionBoundActionExecutor
+import com.landosol.toolbox.automation.TaskConfigurationGate
 import com.landosol.toolbox.automation.capture.CaptureFrameBus
 import com.landosol.toolbox.labyrinth.batch.LabyrinthRunTerminalEvent
 import kotlinx.coroutines.Dispatchers
@@ -12,11 +13,64 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.runCurrent
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LabyrinthEntryRecognitionSessionTest {
+    @Test fun `transfer refuses vision startup before capture and strategy reads`() = runTest {
+        val gate = TaskConfigurationGate()
+        val manager = AutomationSessionManager()
+        val held = gate.beginTransfer { true }
+        var captureChecks = 0
+        var strategyCalls = 0
+        val session = LabyrinthEntryRecognitionSession(
+            sessionManager = manager, configurationGate = gate,
+            captureActive = { captureChecks++; true }, captureStop = {},
+            strategyProvider = { strategyCalls++; LabyrinthStrategySnapshot(LabyrinthStrategySettings(), null) },
+            processorFactory = { { error("no frames") } },
+        )
+        try {
+            assertEquals(LabyrinthEntryRecognitionStartResult.Blocked(TaskConfigurationGate.TRANSFER_MESSAGE), session.start())
+            assertEquals(0, captureChecks)
+            assertEquals(0, strategyCalls)
+            assertNull(manager.current())
+            assertFalse(session.state.value.running)
+        } finally {
+            try { session.stop() } finally { held.close() }
+        }
+    }
+
+    @Test fun `startup admission covers synchronous strategy initialization and releases on failure`() = runTest {
+        val gate = TaskConfigurationGate()
+        val manager = AutomationSessionManager()
+        var strategyCalls = 0
+        val session = LabyrinthEntryRecognitionSession(
+            sessionManager = manager, configurationGate = gate,
+            captureActive = { true }, captureStop = {},
+            strategyProvider = {
+                strategyCalls++
+                assertEquals(1, gate.state.value.admissions)
+                assertThrows(IllegalStateException::class.java) { gate.beginTransfer { true }.close() }
+                error("unavailable strategy")
+            },
+            processorFactory = { { error("no frames") } },
+        )
+        try {
+            val result = session.start()
+            assertEquals("strategy initialization must actually run", 1, strategyCalls)
+            assertTrue(result is LabyrinthEntryRecognitionStartResult.Blocked)
+            assertTrue((result as LabyrinthEntryRecognitionStartResult.Blocked).reason.contains("unavailable strategy"))
+            assertNull(manager.current())
+            assertFalse(session.state.value.running)
+            assertEquals(TaskConfigurationGate.State(), gate.state.value)
+            gate.beginTransfer { true }.close()
+        } finally { session.stop() }
+    }
+
     @Test
     fun `result without a route does not end the run even after score timeout`() = runTest {
         val manager = AutomationSessionManager()

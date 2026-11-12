@@ -226,6 +226,16 @@ object CaptureStateRegistry {
 
     fun isActive(): Boolean = state.value is CaptureState.Running
 
+    /**
+     * Pixel size of the virtual display that is currently being captured, or null while idle.
+     *
+     * This is the same width/height that the capture surface was created with, so a caller that
+     * needs to prepare per-resolution work (template pre-scaling, for instance) can ask here
+     * instead of waiting for the first frame or guessing from settings.
+     */
+    fun captureSize(): Pair<Int, Int>? =
+        (state.value as? CaptureState.Running)?.let { it.width to it.height }
+
     fun lastStopReason(): String? = lastStopReason
 
     fun gestureDisplayId(): Int =

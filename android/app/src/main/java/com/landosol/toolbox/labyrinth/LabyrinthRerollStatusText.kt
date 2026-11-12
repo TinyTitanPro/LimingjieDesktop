@@ -1,7 +1,10 @@
 package com.landosol.toolbox.labyrinth
 
 fun labyrinthRerollStatusText(state: LabyrinthUiState, now: Long = System.currentTimeMillis()): String {
-    val guild = state.guildOptions.firstOrNull { it.guildId == state.selectedGuildId }?.name ?: "未选择公会"
+    // 单独刷开局可以在每次启动时临时选公会且不回写设置，所以优先显示任务实际使用的公会，
+    // 否则状态行与通知会一直显示保存设置里的公会（例如设置是美食殿堂、实际刷咲恋救济院）。
+    val effectiveGuildId = state.activeGuildId ?: state.selectedGuildId
+    val guild = state.guildOptions.firstOrNull { it.guildId == effectiveGuildId }?.name ?: "未选择公会"
     val seconds = state.startedAtMillis?.let { ((now - it).coerceAtLeast(0) / 1000) } ?: 0
     val stage = when {
         state.captcha != null -> "需要验证码，请返回应用处理"

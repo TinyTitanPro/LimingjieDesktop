@@ -274,7 +274,7 @@ internal enum class Page(val label:String,val icon:String) { Run("运行","play_
         onStopEntryRecognition={actions.run{graph.stopAll().join()}},
         onStartAutoRun={goals-> actions.run { withContext(Dispatchers.IO){graph.ux.preferences.update { it.copy(goals=goals.map { g->DesktopGoal(g.guildId,g.targetCount,g.mode==LabyrinthBatchGoalMode.CLEARS) }) }}
             if(graph.startLabyrinthAutoRun(s.task.selectedAccount?.id,goals)) close() else graph.labyrinthController.reportMessage("自动执行未启动，请检查账号、设备、触控和 OCR，并停止其他任务后重试") }},
-        onStopAutoRun=graph::stopLabyrinthAutoRun,onCaptchaSolved={graph.labyrinthController.reportMessage("请使用此标签的验证入口")},onCaptchaError=graph.labyrinthController::reportMessage,onCancelCaptcha=graph.labyrinthController::cancelCaptcha,onOpenStrategies=strategies)
+        onStopAutoRun=graph::stopLabyrinthAutoRun,onCaptchaSolved={graph.labyrinthController.reportMessage("请使用此标签的验证入口")},onCaptchaError=graph.labyrinthController::reportMessage,onCancelCaptcha=graph.labyrinthController::cancelCaptcha)
 }
 
 internal class UiActions(private val scope:CoroutineScope,private val graph:ControlSessionUi) {

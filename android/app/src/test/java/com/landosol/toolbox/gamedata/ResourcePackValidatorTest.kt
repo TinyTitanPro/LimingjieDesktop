@@ -140,7 +140,8 @@ class ResourcePackValidatorTest {
             assertTrue(tankEvent.translatedEffect.contains("掩护者职阶角色随机"))
             val icons = loaded.data.icons
             assertTrue(icons != null)
-            assertEquals(801, icons!!.characterIcons.size)
+            // 800 = 801 张里删掉 icon_unit_170161.png（环奈 6 星错图，与吉塔 6 星 MD5 相同）。
+            assertEquals(800, icons!!.characterIcons.size)
             assertEquals(369, icons.coverage.coveredCharacters)
             assertEquals(109, icons.relicIcons.size)
             assertEquals(109, icons.coverage.coveredRelics)

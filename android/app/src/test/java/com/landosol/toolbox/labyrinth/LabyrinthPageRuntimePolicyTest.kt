@@ -11,6 +11,7 @@ import com.landosol.toolbox.labyrinth.vision.LabyrinthCharacterMatch
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryFrameResult
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryPageObservation
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryPageState
+import com.landosol.toolbox.labyrinth.vision.LabyrinthEventOcrDiagnostics
 import com.landosol.toolbox.labyrinth.vision.EntryAnchorId
 import com.landosol.toolbox.labyrinth.vision.EntryAnchorMatch
 import com.landosol.toolbox.labyrinth.node.LabyrinthNodeTypes
@@ -169,17 +170,7 @@ class LabyrinthPageRuntimePolicyTest {
     @Test
     fun `single-choice event needs both trigger and select anchors`() {
         val rect = EntryPixelRect(820, 805, 295, 145)
-        val trusted = result(
-            LabyrinthEntryPageState.EVENT_CHOICE,
-            anchorScores = mapOf(
-                EntryAnchorId.EVENT_SINGLE_CHOICE_TRIGGER_TITLE to 0.94,
-                EntryAnchorId.EVENT_SINGLE_CHOICE_SELECT_BUTTON to 0.96,
-            ),
-        ).copy(
-            anchorMatches = mapOf(
-                EntryAnchorId.EVENT_SINGLE_CHOICE_SELECT_BUTTON to EntryAnchorMatch(0.96, rect),
-            ),
-        )
+        val trusted = singleChoiceEventResult(rect)
         assertEquals(rect, labyrinthSingleChoiceEventButtonRect(trusted))
 
         val weakTitle = trusted.copy(
@@ -195,6 +186,89 @@ class LabyrinthPageRuntimePolicyTest {
         assertNull(labyrinthSingleChoiceEventButtonRect(weakTitle))
         assertNull(labyrinthSingleChoiceEventButtonRect(trusted.copy(anchorMatches = emptyMap())))
     }
+
+    @Test
+    fun `single-choice templates cannot override complete two or three choice layouts`() {
+        val frame = singleChoiceEventResult()
+        for (count in listOf(2, 3)) {
+            assertNull(labyrinthSingleChoiceEventButtonRect(frame.copy(
+                eventOcrDiagnostics = LabyrinthEventOcrDiagnostics(
+                    status = "NO_CATALOG_MATCH",
+                    completeLayoutCount = count,
+                ),
+            ), eventCustomizationEnabled = true))
+        }
+    }
+
+    @Test
+    fun `single-choice templates never preempt title OCR fast path`() {
+        val frame = singleChoiceEventResult()
+        for (status in listOf(
+            "TITLE_WAITING_OCR",
+            "TITLE_CANDIDATE_MATCH",
+            "TITLE_TRUSTED_MATCH",
+            "TITLE_FALLBACK",
+            "TITLE_FUTURE_STATE",
+        )) {
+            assertNull(labyrinthSingleChoiceEventButtonRect(frame.copy(
+                eventOcrDiagnostics = LabyrinthEventOcrDiagnostics(
+                    status = status,
+                    completeLayoutCount = 1,
+                ),
+            ), eventCustomizationEnabled = true))
+        }
+    }
+
+    @Test
+    fun `single-choice templates wait for pending OCR even with a complete single layout`() {
+        val frame = singleChoiceEventResult()
+        for (count in listOf(null, 1)) {
+            assertNull(labyrinthSingleChoiceEventButtonRect(frame.copy(
+                eventOcrDiagnostics = LabyrinthEventOcrDiagnostics(
+                    status = "WAITING_OCR",
+                    completeLayoutCount = count,
+                ),
+            ), eventCustomizationEnabled = true))
+        }
+    }
+
+    @Test
+    fun `single-choice templates retain original behavior without OCR diagnostics`() {
+        val rect = EntryPixelRect(820, 805, 295, 145)
+        val frame = singleChoiceEventResult(rect)
+        assertNull(frame.eventOcrDiagnostics)
+        assertEquals(rect, labyrinthSingleChoiceEventButtonRect(frame))
+    }
+
+    @Test
+    fun `single-choice templates may fall back after unmatched or ineligible OCR`() {
+        val rect = EntryPixelRect(820, 805, 295, 145)
+        val frame = singleChoiceEventResult(rect)
+        for (status in listOf("NO_CATALOG_MATCH", "INELIGIBLE_PAGE_OR_MOVE_DIALOG")) {
+            for (count in listOf(null, 1)) {
+                assertEquals(rect, labyrinthSingleChoiceEventButtonRect(frame.copy(
+                    eventOcrDiagnostics = LabyrinthEventOcrDiagnostics(
+                        status = status,
+                        completeLayoutCount = count,
+                    ),
+                )))
+            }
+        }
+    }
+
+    private fun singleChoiceEventResult(
+        rect: EntryPixelRect = EntryPixelRect(820, 805, 295, 145),
+    ) = result(
+        LabyrinthEntryPageState.EVENT_CHOICE,
+        anchorScores = mapOf(
+            EntryAnchorId.EVENT_SINGLE_CHOICE_TRIGGER_TITLE to 0.94,
+            EntryAnchorId.EVENT_SINGLE_CHOICE_SELECT_BUTTON to 0.96,
+        ),
+    ).copy(
+        anchorMatches = mapOf(
+            EntryAnchorId.EVENT_SINGLE_CHOICE_SELECT_BUTTON to EntryAnchorMatch(0.96, rect),
+        ),
+    )
 
     @Test
     fun `EX identity probe restarts on every fresh visit to the challenge page`() {
@@ -437,6 +511,37 @@ class LabyrinthPageRuntimePolicyTest {
                 bossSummaryNextButtonMatch = EntryAnchorMatch(0.99, rect),
             ),
         )
+    }
+
+    @Test
+    fun `1088 recovery requires first start evidence and rejects route owned pickers`() {
+        val start = LabyrinthNodeJson(1, 1, 1, 10101L, LabyrinthNodeTypes.START, null, emptyList(), false)
+        val state = NodeSessionState(1, 10101L, listOf(10101L))
+        fun allowed(
+            route: NodeSessionState? = state,
+            node: LabyrinthNodeJson? = start,
+            transition: Boolean = false,
+            activeType: Int? = null,
+            imprintPending: Boolean = false,
+        ) = labyrinthAllowsInitial1088GeometryRefinement(route, node, transition, activeType, imprintPending)
+        assertTrue(allowed())
+        assertTrue(allowed(route = null))
+        assertTrue(allowed(node = null))
+        assertFalse(allowed(route = null, node = null))
+        assertTrue(labyrinthAllowsInitial1088GeometryRefinement(null, null, false, null, false, initialStartExecuted = true))
+        assertFalse(labyrinthAllowsInitial1088GeometryRefinement(null, null, true, null, false, initialStartExecuted = true))
+        assertFalse(labyrinthAllowsInitial1088GeometryRefinement(null, null, false, LabyrinthNodeTypes.EVENT, false, initialStartExecuted = true))
+        assertFalse(allowed(transition = true))
+        assertFalse(allowed(imprintPending = true))
+        assertFalse(allowed(activeType = LabyrinthNodeTypes.EVENT))
+        assertFalse(allowed(activeType = LabyrinthNodeTypes.SHOP))
+        assertFalse(allowed(node = start.copy(blockType = LabyrinthNodeTypes.EVENT)))
+        assertFalse(allowed(node = start.copy(blockType = LabyrinthNodeTypes.SHOP)))
+        assertFalse(allowed(node = start.copy(area = 2)))
+        assertFalse(allowed(route = state.copy(currentArea = 2)))
+        assertFalse(allowed(route = state.copy(visitedNodes = listOf(10101L, 10102L))))
+        assertFalse(allowed(route = state.copy(currentNodeId = 10102L)))
+        assertFalse(allowed(route = state.copy(isComplete = true)))
     }
 
     @Test

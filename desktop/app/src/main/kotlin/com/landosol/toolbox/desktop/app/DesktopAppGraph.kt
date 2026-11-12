@@ -404,15 +404,27 @@ class DesktopAppGraph(
     val automationActionExecutor by lazy {
         SessionBoundActionExecutor(automationSessionManager, accessibilityActionBackend)
     }
+    val taskConfigurationGate by lazy { com.landosol.toolbox.automation.TaskConfigurationGate() }
+    val labyrinthConfiguration by lazy {
+        if (sharedData == null) {
+            com.landosol.toolbox.labyrinth.AndroidLabyrinthConfigurationStore.create(context)
+        } else {
+            // Worker instances share the host's configuration; keep the snapshot in memory only.
+            com.landosol.toolbox.labyrinth.LabyrinthConfigurationStore(
+                com.landosol.toolbox.labyrinth.LabyrinthConfigurationValues(),
+            ) { }
+        }
+    }
     val clanBattleRecognitionSession by lazy {
-        ClanBattleRecognitionSession(automationSessionManager, overlayCoordinator = automationOverlayCoordinator)
+        ClanBattleRecognitionSession(automationSessionManager, overlayCoordinator = automationOverlayCoordinator,
+            configurationGate = taskConfigurationGate)
     }
     private val labyrinthRoleDecisionData by lazy {
         AndroidLabyrinthRoleDecisionDataLoader(context).load()
     }
     val labyrinthStrategySettings by lazy {
         com.landosol.toolbox.desktop.app.adapters.storage.DesktopStrategyStore(dataDirectory,
-            legacy = { com.landosol.toolbox.labyrinth.AndroidLabyrinthStrategySettingsStore(context, transient = sharedData != null).state.value },
+            legacy = { labyrinthConfiguration.state.value.strategy },
             notice = ::addNotice, transient = sharedData != null)
     }
     @Volatile private var sharedStrategyIdentity: com.landosol.toolbox.desktop.app.adapters.storage.StrategyIdentity? = null
@@ -459,6 +471,10 @@ class DesktopAppGraph(
             ?.mapValues { (_, profile) -> profile.attribute }
             .orEmpty()
         LabyrinthEntryRecognitionSession(
+            configurationGate = taskConfigurationGate,
+            openingRelicCatalog = com.landosol.toolbox.labyrinth.LabyrinthOpeningRelicCatalog(
+                com.landosol.toolbox.labyrinth.vision.AndroidLabyrinthRelicTemplateLoader(context).loadRelics(),
+            ),
             strategyProvider = {
                 val settings = taskStrategy?.settings ?: labyrinthStrategySettings.state.value
                 com.landosol.toolbox.labyrinth.LabyrinthStrategySnapshot(
@@ -494,10 +510,16 @@ class DesktopAppGraph(
                     characterAttributes = characterAttributes,
                     finalBossOnly = finalBossOnly,
                     skipJoinedCharacters = { labyrinthEntryRecognitionSession.skipRoleRewardJoinedRecognition },
+                    relicEvidenceVersion = { labyrinthEntryRecognitionSession.relicEvidenceVersion },
+                    relicVerificationMarks = { labyrinthEntryRecognitionSession.relicVerificationMarks },
                     nodeSearchHint = { labyrinthEntryRecognitionSession.currentNodeSearchHint() },
                     nodeScanRequested = { labyrinthEntryRecognitionSession.nodeScanRequested() },
                     nodeScanConsumable = { labyrinthEntryRecognitionSession.nodeScanConsumable() },
                     rosterCharacterIds = { labyrinthEntryRecognitionSession.rosterCharacterIds() },
+                    captureFrameSize = CaptureStateRegistry::captureSize,
+                    eventChoiceOverrides = labyrinthEntryRecognitionSession.eventChoiceOverridesSnapshot,
+                    eventCustomizationEnabled = labyrinthEntryRecognitionSession.eventCustomizationEnabledSnapshot,
+                    allowInitial1088GeometryRefinement = { labyrinthEntryRecognitionSession.allowInitial1088GeometryRefinement() },
                     readResultScore = false,
                 )::processDesktopFrame
             },
@@ -640,14 +662,16 @@ class DesktopAppGraph(
             }
     val accountRepository: AccountRepository by lazy {
         AccountRepository(database, credentialStore, sessionStore, gameSessionRegistry,
-            onGameUidUpdated = { id, uid -> sharedData?.updateGameUid(id, uid) })
+            onGameUidUpdated = { id, uid -> sharedData?.updateGameUid(id, uid) },
+            configurationGate = taskConfigurationGate)
     }
     val labyrinthController by lazy {
         com.landosol.toolbox.labyrinth.LabyrinthController(
             accountRepository, gameSessionRegistry, database, { bilibiliNativeLoginCoordinator },
-            if (sharedData == null) com.landosol.toolbox.labyrinth.AndroidLabyrinthRerollSettingsStore(context) else sharedRerollCache,
+            labyrinthConfiguration,
             launchForeground = ::startRerollHost,
             scope = mainScope,
+            configurationGate = taskConfigurationGate,
             beforeRerollLogin = { accountId -> withContext(Dispatchers.IO) { hardCloseChannelClientBeforeReroll(accountId) } },
             afterStandaloneReroll = { accountId -> coldStartChannelClientAfterReroll(accountId) },
         )
@@ -761,6 +785,7 @@ class DesktopAppGraph(
         GameSessionResetWorkflow(
             actionScope = resetScope,
             sessionManager = automationSessionManager,
+            configurationGate = taskConfigurationGate,
             backend = CompositeSessionResetBackend(
                 terminator = terminator,
                 relauncher = Relauncher {
@@ -926,6 +951,29 @@ class DesktopAppGraph(
     }
 
     private val autoRunScope = CoroutineScope(SupervisorJob() + Dispatchers.Default + failures)
+
+    fun configurationTransferBlockedReason(): String? {
+        val batch = labyrinthBatchController.state.value
+        val batchPending = batch?.stage in ACTIVE_BATCH_STAGES ||
+            (batch?.stage == com.landosol.toolbox.labyrinth.batch.LabyrinthBatchStage.PAUSED &&
+                labyrinthBatchController.haltReason.value != com.landosol.toolbox.labyrinth.batch.LabyrinthBatchHaltReason.USER_STOPPED)
+        return if (labyrinthController.blocksConfigurationTransfer || batchPending || autoRunJob?.isCompleted == false ||
+            startingState.value || stoppingState.value ||
+            labyrinthEntryRecognitionSession.state.value.running || gameSessionResetWorkflow.state.value.running ||
+            clanBattleRecognitionSession.state.value.running || labyrinthAutoRunWorkflow.progress.value.running) {
+            com.landosol.toolbox.automation.TaskConfigurationGate.BUSY_MESSAGE
+        } else null
+    }
+
+    suspend fun <T> withConfigurationTransfer(action: suspend () -> T): T {
+        val admission = taskConfigurationGate.beginTransfer { configurationTransferBlockedReason() == null }
+        return try {
+            check(automationSessionManager.current() == null) {
+                com.landosol.toolbox.automation.TaskConfigurationGate.BUSY_MESSAGE
+            }
+            action()
+        } finally { admission.close() }
+    }
 
     @Volatile
     private var autoRunJob: Job? = null

@@ -69,7 +69,9 @@ class LabyrinthRoleRewardCommitTest {
         override suspend fun startNew(accountId: Long?, nowMillis: Long) = snapshot
         override suspend fun load(accountId: Long?) = snapshot
         override suspend fun recordPage(accountId: Long?, page: String, characters: List<LabyrinthCharacterMatch>,
-            nowMillis: Long, relics: List<LabyrinthRelicMatch>, replaceCharacters: Boolean): LabyrinthRunSnapshot {
+            nowMillis: Long, relics: List<LabyrinthRelicMatch>, replaceCharacters: Boolean,
+            expectedStartedAt: Long?, relicStacks: Map<LabyrinthRelicMark, LabyrinthRelicStackRecord>?,
+            openingRelicReceipt: LabyrinthOpeningRelicReceipt?): LabyrinthRunSnapshot {
             writes++
             if (fail) error("test disk failure")
             snapshot = snapshot.copy(joinedCharacters = LabyrinthRosterMerger.merge(

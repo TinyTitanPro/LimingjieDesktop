@@ -42,7 +42,9 @@ private class JsonPreferences(private val file: File, onRecovered: (File) -> Uni
     override fun getLong(key: String, defValue: Long): Long = (value(key, "long") as Number?)?.toLong() ?: defValue
     override fun getFloat(key: String, defValue: Float): Float = (value(key, "float") as Number?)?.toFloat() ?: defValue
     override fun getBoolean(key: String, defValue: Boolean): Boolean = value(key, "boolean") as Boolean? ?: defValue
-    @Synchronized override fun contains(key: String): Boolean = values.has(key)
+    @get:Synchronized override val all: Map<String, Any?> get() =
+        values.keys().asSequence().associateWith { key -> values.optJSONObject(key)?.opt("value") }
+    override fun contains(key: String): Boolean = values.has(key)
     override fun edit(): SharedPreferences.Editor = Editor()
     private inner class Editor : SharedPreferences.Editor {
         private val changes = LinkedHashMap<String, JSONObject?>()

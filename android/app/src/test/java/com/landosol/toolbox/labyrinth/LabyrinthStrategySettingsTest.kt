@@ -93,10 +93,10 @@ class LabyrinthStrategySettingsTest {
             .forEach { assertNotNull(it.validationError()) }
     }
 
-    @Test fun `response interval defaults to the fast tier and survives persistence`() {
-        assertEquals(RESPONSE_INTERVAL_FAST, LabyrinthStrategySettings().responseIntervalMillis)
-        // 旧配置没有该字段时必须落到当前行为，而不是上游 1.0.18 之前的 500。
-        assertEquals(RESPONSE_INTERVAL_FAST,
+    @Test fun `response interval defaults to the standard tier and survives persistence`() {
+        assertEquals(RESPONSE_INTERVAL_STANDARD, LabyrinthStrategySettings().responseIntervalMillis)
+        // 旧配置没有该字段时落到默认档（500），需要更快时由用户在设置里切到 300。
+        assertEquals(RESPONSE_INTERVAL_STANDARD,
             LabyrinthStrategySettingsCodec.decode("{\"playerWeight\":50}").responseIntervalMillis)
         listOf(RESPONSE_INTERVAL_FAST, RESPONSE_INTERVAL_STANDARD).forEach { interval ->
             val settings = LabyrinthStrategySettings(responseIntervalMillis = interval)
@@ -115,7 +115,7 @@ class LabyrinthStrategySettingsTest {
                 LabyrinthStrategySettings(responseIntervalMillis = interval).validationError(),
             )
         }
-        assertEquals(RESPONSE_INTERVAL_FAST, DEFAULT_RESPONSE_INTERVAL_MILLIS)
+        assertEquals(RESPONSE_INTERVAL_STANDARD, DEFAULT_RESPONSE_INTERVAL_MILLIS)
     }
 
     private fun productionDocument(): LabyrinthRoleDecisionDocument {

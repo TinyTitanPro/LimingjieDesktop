@@ -18,6 +18,8 @@ import com.landosol.toolbox.automation.overlay.AutomationOverlayPresentation
 import com.landosol.toolbox.automation.overlay.AutomationOverlaySessionHandler
 import com.landosol.toolbox.automation.AutomationAction
 import com.landosol.toolbox.automation.ScreenPoint
+import com.landosol.toolbox.labyrinth.vision.LabyrinthRelicRewardKind
+import com.landosol.toolbox.labyrinth.vision.LabyrinthRelicRewardObservation
 import com.landosol.toolbox.automation.accessibility.GAME_NOT_FOREGROUND_REASON
 import com.landosol.toolbox.automation.session.SessionBlockClassifier
 import com.landosol.toolbox.automation.session.SessionBlockKind
@@ -39,6 +41,7 @@ import com.landosol.toolbox.labyrinth.vision.labyrinthRelicDetailHoldsFrame
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopDialogState
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemKind
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemStatus
+import com.landosol.toolbox.labyrinth.vision.LabyrinthSpecialEquipmentStage
 import com.landosol.toolbox.labyrinth.node.LabyrinthNodeSession
 import com.landosol.toolbox.labyrinth.node.LabyrinthNodeActionPlanner
 import com.landosol.toolbox.labyrinth.node.LabyrinthMapScanDirection
@@ -456,6 +459,10 @@ internal const val POST_ENTRY_STALL_TIMEOUT_MILLIS = 120_000L
  * 就点下一处」这类插队挡在间隔之外。真正的兜底是动作被吞之后的回收重试，间隔只负责降低吞点击的概率。
  */
 internal const val BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 600L
+
+/** 任意节点编号 → 它所属的区域（1~5）；万位不合法时返回 null。 */
+internal fun labyrinthNodeAreaOf(blockId: Long?): Int? =
+    blockId?.let { (it / 10_000).toInt().takeIf { area -> area in 1..5 } }
 
 internal enum class LabyrinthEventFreeRoleBlockedAction { WAIT, STOP }
 
@@ -962,6 +969,8 @@ internal enum class LabyrinthPostBossStage {
 }
 
 /**
+ * Stage to adopt when the final RESULT page is recognized.
+ *
  * Reconcile settlement progress with the recognized page. A close tap can merely skip the
  * score animation, so a lingering RESULT must remain retryable. Once a chest or final item
  * page is recognized, it also proves that RESULT has closed, even if the last RESULT frame
@@ -1120,6 +1129,7 @@ class LabyrinthEntryRecognitionSession(
     private val battleTeamRecommendationUnavailableReason: String? = null,
     private var battleTeamSelectionPlanner: LabyrinthBattleTeamSelectionPlanner? = null,
     private val runStateStore: LabyrinthRunStateStore? = null,
+    private val openingRelicCatalog: LabyrinthOpeningRelicCatalog = LabyrinthOpeningRelicCatalog(emptyList()),
     private val routeLoader: (suspend (Long?) -> LabyrinthRouteJson?)? = null,
     private val routeProgressSaver: (suspend (Long, Long, Long) -> Boolean)? = null,
     private val routeExecutionGate: (suspend (Long?) -> LabyrinthExecutionGateResult)? = null,
@@ -1134,6 +1144,7 @@ class LabyrinthEntryRecognitionSession(
     private val debugFramePublisher: ((CapturedFrame, LabyrinthEntryRecognitionSessionState, LabyrinthEntryFrameResult, AutomationOverlayPresentation) -> Unit)? = null,
     private val clock: () -> Long = System::currentTimeMillis,
     private val strategyProvider: (() -> LabyrinthStrategySnapshot)? = null,
+    private val configurationGate: com.landosol.toolbox.automation.TaskConfigurationGate = com.landosol.toolbox.automation.TaskConfigurationGate(),
     private val rerollRequester: (suspend (Long) -> Boolean)? = null,
     /**
      * Formal run outcome for an outer batch orchestrator (labyrinth-full-automation.md §11).
@@ -1230,6 +1241,21 @@ class LabyrinthEntryRecognitionSession(
     fun rosterCharacterIds(): Set<String> = _state.value.joinedCharacters
         .map(LabyrinthJoinedCharacter::characterId)
         .toSet()
+
+    fun allowInitial1088GeometryRefinement(): Boolean {
+        val routeState = nodeSession?.getState()
+        val route = validatedRoute
+        return labyrinthAllowsInitial1088GeometryRefinement(
+            routeState = routeState,
+            persistedNode = labyrinthPersistedCurrentNode(route) ?: routeState?.currentNodeId?.let { id ->
+                route?.nodes?.firstOrNull { it.blockId == id }
+            },
+            hasNodeTransition = pendingNodeTransition != null || confirmedNodeEntryReceipt != null,
+            activeNodeType = activeNodeType,
+            shopChoiceImprintPending = shopChoiceImprintRolePending,
+            initialStartExecuted = initialStartExecuted && !entryPhaseComplete,
+        )
+    }
 
     fun currentNodeSearchHint(): NodeSearchHint? {
         val session = nodeSession ?: return null
@@ -1355,7 +1381,19 @@ class LabyrinthEntryRecognitionSession(
     @Volatile
     private var specialEquipmentAwayFrames = 0
     /**
-     * 超限逃生那次点击（点弹窗1 左下白色「取消」）已经决定、但还没派发出去时的待办。
+     * 一次已经决定、但还没派发出去的超限逃生点击。
+     *
+     * [dialogStage] 是决定这一下时开着的那层弹窗：一个「取消」只对它那一层有效。等会话动作间隔的这几帧
+     * 里画面可能已经换层（弹窗2 在「自动装备」之后才出现），那时同一个「取消」矩形指向的是另一层的
+     * 按钮，照着重放就会关掉别的弹窗、把原来那层留在屏幕上。
+     */
+    private data class PendingSpecialEquipmentEscape(
+        val tap: LabyrinthSpecialEquipmentTap,
+        val dialogStage: LabyrinthSpecialEquipmentStage,
+    )
+
+    /**
+     * 超限逃生那次「取消」已经决定、但还没派发出去时的待办。
      *
      * 决策只在「超限的那一帧」带 tap，而 stage 那时已经推进到 DONE，后续帧的 DONE 决策不再带 tap；
      * 没有这个待办字段，逃生点击会被动作间隔或帧序吞掉：表现为「只被决定、从未点击」。
@@ -1363,7 +1401,17 @@ class LabyrinthEntryRecognitionSession(
      * 由「本轮已结束但弹窗仍开着」的分支停机并保留诊断。
      */
     @Volatile
-    private var specialEquipmentPendingEscape: LabyrinthSpecialEquipmentTap? = null
+    private var specialEquipmentPendingEscape: PendingSpecialEquipmentEscape? = null
+    /**
+     * 逃生已经用掉的弹窗层：那一层上的「取消」已经派发过，或者等它派发的窗口已经超期。
+     *
+     * 每一层只用一次：逃生要的是「逐层退回编组页」，同一层上重复点「取消」只会落到下一层的按钮上；
+     * 窗口超期的那一层也不再重挂，否则「派发不出去」会变成每 8 秒重来一次的无界等待。
+     */
+    private val specialEquipmentEscapeSpentStages = linkedSetOf<LabyrinthSpecialEquipmentStage>()
+    /** 本步上一次真正派发点击的时刻（重试节奏用）；本步还没派发过时是 [Long.MIN_VALUE]。 */
+    @Volatile
+    private var specialEquipmentStepLastDispatchAt = Long.MIN_VALUE
     /** 逃生点击派发后的等弹窗关闭上限；超期仍未关就停机并保留诊断。 */
     @Volatile
     private var specialEquipmentEscapeDeadline = Long.MIN_VALUE
@@ -1465,6 +1513,12 @@ class LabyrinthEntryRecognitionSession(
     var skipRoleRewardJoinedRecognition: Boolean = false
         private set
     private var roleRewardDecisionCacheKey: String? = null
+    /** Controls every custom event path; false preserves the pre-customization event flow. */
+    var eventCustomizationEnabledSnapshot: Boolean = false
+        private set
+    /** The same immutable start snapshot used by the event planner and title resolver. */
+    var eventChoiceOverridesSnapshot: Map<String, String> = emptyMap()
+        private set
     @Volatile
     private var pendingShopPurchase: LabyrinthRelicMatch? = null
     @Volatile
@@ -1486,6 +1540,9 @@ class LabyrinthEntryRecognitionSession(
     private var plannedShopRefreshConfirmedAt = Long.MIN_VALUE
     @Volatile
     private var shopRelicPurchasesThisCycle = 0
+    /** 300-coin refills already paid for in the current shop node; cleared on every shop entry. */
+    @Volatile
+    private var shopRefreshesThisVisit = 0
     @Volatile
     private var pendingRelicSelection: LabyrinthRelicMatch? = null
     @Volatile
@@ -1506,11 +1563,38 @@ class LabyrinthEntryRecognitionSession(
     @Volatile
     private var relicFocusMark: LabyrinthRelicMark? = null
     /** Latest game-visible "当前：N" values. These override history-derived stacks when known. */
-    private val relicStackLedger = LabyrinthRelicStackLedger()
+    private var relicStackLedger = LabyrinthRelicStackLedger()
+    private val relicIdentityGate = LabyrinthRelicIdentityGate()
+    private val relicRewardIdentityGate = LabyrinthRelicIdentityGate(allowSpecial = true)
+    private var relicRewardHoldSince = Long.MIN_VALUE
+    private var relicRewardRows = emptySet<String>()
+    private var relicRewardLayoutSignature: String? = null
+    private var relicRewardLayoutConfirmations = 0
+    private var relicRewardFrameAt = Long.MIN_VALUE
+    private var openingRelicBaselineKnown = false
+    private data class CancelledRelicAcquisition(val sessionId: AutomationSessionId?, val startedAt: Long?, val relicId: String)
+    private val cancelledRelicAcquisitions = java.util.concurrent.ConcurrentLinkedQueue<CancelledRelicAcquisition>()
+    @Volatile private var activeRunStartedAt: Long? = null
+    @Volatile var relicEvidenceVersion: Long = 0
+        private set
+    private var relicEvidenceAfterMillis = Long.MIN_VALUE
+    private var lastRelicMapRereadAt = Long.MIN_VALUE
+    private var relicMapRereads = 0
     private val relicMarkStackCalibration get() = relicStackLedger.stacks
+    val relicVerificationMarks: Set<String> get() = relicStackLedger.priorityVerificationMarks(clock()).map { it.label }.toSet()
     /** A single OCR read is evidence, not truth; require repeated/same-frame corroboration. */
     @Volatile
     private var lastShopDialogState: LabyrinthShopDialogState = LabyrinthShopDialogState.NONE
+
+    /**
+     * 确认弹窗关闭后，连续看到「商店 + 无弹窗」的帧数，以及第一帧的时间。
+     *
+     * 购买成功后游戏会先闪一帧商店（弹窗=NONE）再弹「购买完成」，那一帧不是取消；
+     * 只有帧数和时间都超过门槛才当成真的取消（见 [SHOP_CONFIRM_CANCEL_FRAMES] /
+     * [SHOP_CONFIRM_CANCEL_GRACE_MILLIS]）。
+     */
+    private var shopConfirmClosedFrames = 0
+    private var shopConfirmClosedAt = Long.MIN_VALUE
     private val nodeConflictRecovery = com.landosol.toolbox.labyrinth.node.LabyrinthNodeConflictRecovery()
     @Volatile
     private var nodeSession: LabyrinthNodeSession? = null
@@ -1521,6 +1605,8 @@ class LabyrinthEntryRecognitionSession(
     private var finalBossLocalizationStartedAt = Long.MIN_VALUE
     @Volatile
     private var entryPhaseComplete = false
+    @Volatile
+    private var initialStartExecuted = false
     @Volatile
     private var pendingNodeClickBlockId: Long = Long.MIN_VALUE
     @Volatile
@@ -1719,6 +1805,16 @@ class LabyrinthEntryRecognitionSession(
         dryRun: Boolean = true,
         accountId: Long? = null,
         runId: String? = null,
+    ): LabyrinthEntryRecognitionStartResult {
+        val admission = configurationGate.tryBeginTask()
+            ?: return LabyrinthEntryRecognitionStartResult.Blocked(com.landosol.toolbox.automation.TaskConfigurationGate.TRANSFER_MESSAGE)
+        return try { startAdmitted(dryRun, accountId, runId) } finally { admission.close() }
+    }
+
+    private suspend fun startAdmitted(
+        dryRun: Boolean,
+        accountId: Long?,
+        runId: String?,
     ): LabyrinthEntryRecognitionStartResult = mutex.withLock {
         activeSessionId?.let { return LabyrinthEntryRecognitionStartResult.AlreadyRunning(it) }
         sessionManager.current()?.let { running ->
@@ -1787,6 +1883,8 @@ class LabyrinthEntryRecognitionSession(
         singleBossRetryCountBeforeMulti = 2
         pendingSingleBossFallbackToMulti = false
         bossFallbackMultiTeamActive = false
+        eventCustomizationEnabledSnapshot = strategySnapshot?.settings?.eventCustomizationEnabled == true
+        eventChoiceOverridesSnapshot = strategySnapshot?.settings?.effectiveEventChoiceOverrides()?.toMap().orEmpty()
         strategySnapshot?.let { snapshot ->
             configuredBossTeamMode = snapshot.settings.bossTeamMode
             bossTeamMode = configuredBossTeamMode
@@ -1814,7 +1912,7 @@ class LabyrinthEntryRecognitionSession(
             battleTeamSelectionPlanner = snapshot.roleRuntime?.battleTeamSelectionPlanner
         }
         val initialRunSnapshot = try {
-            runStateStore?.begin(accountId, clock())
+            persistenceMutex.withLock { runStateStore?.begin(accountId, clock()) }
         } catch (failure: Throwable) {
             sessionManager.stop(session.id)
             requestCaptureStop()
@@ -1883,6 +1981,7 @@ class LabyrinthEntryRecognitionSession(
         shopRelicPurchasesThisCycle = 0
         plannedShopPurchaseCounted = false
         shopRelicPurchasesThisCycle = 0
+        shopRefreshesThisVisit = 0
         pendingRelicSelection = null
         relicChoiceCommitted = false
         roleRewardChoiceCommitted = false
@@ -1896,7 +1995,13 @@ class LabyrinthEntryRecognitionSession(
         runScoreCollector = LabyrinthRunScoreCollector()
         runStartedAt = clock()
         actionPlanner = if (dryRun) null else createActionPlanner()
-        relicStackLedger.seedAcquisitions(relicChoicePolicy.markStacks(initialRunSnapshot?.observedRelics.orEmpty()))
+        activeRunStartedAt = initialRunSnapshot?.startedAt
+        val fixedReceipt = initialRunSnapshot?.openingRelicReceipt?.takeIf { it.enterId == validatedRoute?.enterId }
+        openingStateReset.set(fixedReceipt != null)
+        openingRelicBaselineKnown = fixedReceipt?.complete == true
+        relicStackLedger.restore(initialRunSnapshot?.observedRelics.orEmpty(), initialRunSnapshot?.relicStacks.orEmpty())
+        relicIdentityGate.clear()
+        invalidateRelicEvidence(clock())
         _state.value = LabyrinthEntryRecognitionSessionState(
             status = LabyrinthEntryRecognitionStatus.RUNNING,
             sessionId = session.id,
@@ -2131,7 +2236,7 @@ class LabyrinthEntryRecognitionSession(
         queuedFrame.getAndSet(null)?.let { recycle(it.frame) }
     }
 
-    private fun onFrame(
+    private suspend fun onFrame(
         sessionId: AutomationSessionId,
         processor: (CapturedFrame) -> LabyrinthEntryFrameResult,
         frame: CapturedFrame,
@@ -2172,6 +2277,7 @@ class LabyrinthEntryRecognitionSession(
                 frameHeight = frameHeight,
                 timestampMillis = frame.timestampMillis,
             )
+            if (activeSessionId != sessionId || _state.value.paused) return@runCatching
             debugFramePublisher?.invoke(
                 frame,
                 _state.value,
@@ -2191,7 +2297,7 @@ class LabyrinthEntryRecognitionSession(
         requestStopAfterFailure(sessionId, reason)
     }
 
-    private fun processFrameResult(
+    private suspend fun processFrameResult(
         sessionId: AutomationSessionId,
         result: LabyrinthEntryFrameResult,
         frameWidth: Int,
@@ -2373,19 +2479,34 @@ class LabyrinthEntryRecognitionSession(
                     preservePendingNodeTransitionForMismatch,
         )
         synchronizeBossEditor(result)
-        refreshRelicStackCalibration(result)
+        observeRelicIdentities(result, timestampMillis)
+        applyRelicCancellations(relicStackLedger)
+        val stagedRelics = relicStackLedger.fork()
+        refreshRelicStackCalibration(result, stagedRelics)
+        if (!persistObservation(sessionId, result, timestampMillis, stagedRelics)) return
+        if (activeSessionId != sessionId || _state.value.paused) return
+        if (holdRelicRewardReceipt(sessionId, result, timestampMillis)) return
         refreshRoleRewardChoiceDecision(sessionId, result, frameWidth, frameHeight)
         refreshEventChoiceDecision(sessionId, result)
         refreshEffectiveCharacterScan(sessionId, result, frameWidth, frameHeight, timestampMillis)
         refreshBattleTeamRecommendation(sessionId, pageState)
         refreshBattleTeamSelectionPlan(sessionId, pageState, result.battleTeamSelection)
         overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
-        persistObservation(sessionId, result, timestampMillis)
         if (!current.dryRun && entryPhaseComplete &&
             handleBattleWaitFrame(sessionId, result, timestampMillis)
         ) return
         val relicDetail = result.relicDetailObservation
-        if (relicDetail != null && labyrinthRelicDetailHoldsFrame(result)) {
+        val relicDetailHoldsFrame = relicDetail != null && labyrinthRelicDetailHoldsFrame(result)
+        if (relicDetailHoldsFrame && !current.dryRun && specialEquipmentAwaitsDialog()) {
+            // 「特别装备」正等着弹窗1/弹窗2 出现时，弹窗显现/关闭的过渡帧与「系列效果一览」共用同一套
+            // 面板外观，识别器在过渡帧上给不出 stage，这一帧就会被下面的系列详情持帧判定整帧吞掉——
+            // 本轮等的正是这个弹窗。所以只等一帧：不持帧、不点击，也不推进系列详情的持帧计时。
+            publishSpecialEquipmentMessage(
+                "特别装备：等待弹窗出现，暂不执行点击（当前画面与系列详情面板外观相同）",
+            )
+            return
+        }
+        if (relicDetail != null && relicDetailHoldsFrame) {
             // This popup is only ever opened by hand, and the run deliberately does not close it
             // so the operator can read it. That made it an unbounded wait: a popup left open (or
             // one the classifier keeps seeing) parked the route with no deadline at all. Reading
@@ -2406,6 +2527,25 @@ class LabyrinthEntryRecognitionSession(
             return
         }
         relicDetailHoldSince = Long.MIN_VALUE
+        if (!current.dryRun && pageState == LabyrinthEntryPageState.NODE_SELECTION && relicChoiceCommitted && pendingRelicSelection != null) {
+            _state.value = _state.value.copy(message = "正在确认遗物获得结果")
+            overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
+            return
+        }
+        if (!current.dryRun && pageState == LabyrinthEntryPageState.NODE_SELECTION &&
+            result.nodeMoveConfirmation == null && relicStackLedger.waitingForMap(timestampMillis)
+        ) {
+            if (lastRelicMapRereadAt == Long.MIN_VALUE) lastRelicMapRereadAt = timestampMillis
+            if (relicMapRereads < 1 && timestampMillis - lastRelicMapRereadAt >= 5_000L) {
+                relicEvidenceVersion++
+                relicStackLedger.beginMapReread()
+                lastRelicMapRereadAt = timestampMillis
+                relicMapRereads++
+            }
+            _state.value = _state.value.copy(message = "遗物已获得，正在复核地图系列层数")
+            overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
+            return
+        }
         if (!current.dryRun && handleShopRefreshConfirmationFrame(
                 sessionId = sessionId,
                 result = result,
@@ -2514,6 +2654,15 @@ class LabyrinthEntryRecognitionSession(
             }
         }
         val persistedCurrentNode = labyrinthPersistedCurrentNode(validatedRoute)
+        // A resumed run can reopen straight on a shop page, where no node tap ever wrote the area.
+        // Fall back to the persisted node, and to the block-id prefix when the node carries no
+        // area, so an area-4 shop is never judged by a route progress that already flipped to the
+        // next area. Area 4 is the hard saving stop, and that decision must not depend on which
+        // path got here first.
+        if (activeNodeArea == null && persistedCurrentNode?.blockType == LabyrinthNodeTypes.SHOP) {
+            activeNodeType = LabyrinthNodeTypes.SHOP
+            activeNodeArea = persistedCurrentNode.area ?: labyrinthNodeAreaOf(persistedCurrentNode.blockId)
+        }
         val effectiveNodeType = activeNodeType ?: persistedCurrentNode?.blockType
         val eventFreeRoleSelection = labyrinthEventFreeRoleSelectionOwnsFrame(
             pageState = pageState,
@@ -2760,6 +2909,7 @@ class LabyrinthEntryRecognitionSession(
     }
 
     private fun clearPlannedShopPurchase() {
+        plannedShopPurchaseRelicId?.let { cancelledRelicAcquisitions.add(CancelledRelicAcquisition(activeSessionId, activeRunStartedAt, it)) }
         plannedShopPurchaseRelicId = null
         plannedShopRoleImprintLabel = null
         plannedShopPurchaseStartedAt = Long.MIN_VALUE
@@ -2849,34 +2999,108 @@ class LabyrinthEntryRecognitionSession(
      * Reconcile history-derived mark stacks with the value printed by the game itself.
      * Multiple cards with the same mark must agree before that mark is accepted as calibration.
      */
-    private fun refreshRelicStackCalibration(result: LabyrinthEntryFrameResult) {
+    private fun refreshRelicStackCalibration(result: LabyrinthEntryFrameResult, ledger: LabyrinthRelicStackLedger) {
+        if (result.relicRewardObservation != null) return
+        if (result.relicEvidenceVersion != relicEvidenceVersion) return
         result.relicDetailObservation?.let { detail ->
-            if (detail.titleConfirmed) detail.entries.forEach { (mark, value) ->
-                relicStackLedger.observe(mark, value, LabyrinthRelicStackLedger.Source.DETAIL,
-                    mark.name, detail.evidenceId)
+            if (detail.titleConfirmed && detail.capturedAtMillis > relicEvidenceAfterMillis) detail.entries.forEach { (mark, value) ->
+                ledger.observe(mark, value, LabyrinthRelicStackSource.DETAIL,
+                    mark.name, detail.evidenceId, detail.capturedAtMillis)
             }
         }
-        result.relicChoiceSelection?.choices.orEmpty().filter { it.recognized }
-            .groupBy { LabyrinthRelicMark.fromLabel(it.attribute) }.forEach { (mark, choices) ->
+        result.relicChoiceSelection?.choices.orEmpty().filter {
+            it.recognized && relicIdentityGate.confirmed(it) && it.currentMarkStacksCapturedAtMillis > relicEvidenceAfterMillis
+        }.groupBy { LabyrinthRelicMark.fromLabel(it.attribute) }.forEach { (mark, choices) ->
             if (mark == null) return@forEach
             val conflicting = choices.mapNotNull { it.currentMarkStacks }.distinct().size > 1
+            if (conflicting) ledger.clearPending(mark)
             choices.forEach { choice ->
-                relicStackLedger.observe(mark, choice.currentMarkStacks.takeUnless { conflicting },
-                    LabyrinthRelicStackLedger.Source.CHOICE, choice.slotId, choice.currentMarkStacksEvidenceId)
+                ledger.observe(mark, choice.currentMarkStacks.takeUnless { conflicting },
+                    LabyrinthRelicStackSource.CHOICE, choice.slotId, choice.currentMarkStacksEvidenceId,
+                    choice.currentMarkStacksCapturedAtMillis)
             }
         }
         result.nodeRelicStackObservation?.entries.orEmpty().forEach { entry ->
             val mark = LabyrinthRelicMark.fromLabel(entry.attribute) ?: return@forEach
-            relicStackLedger.observe(mark, entry.stacks, LabyrinthRelicStackLedger.Source.MAP,
-                entry.slotId, entry.evidenceId)
+            if (entry.capturedAtMillis <= relicEvidenceAfterMillis) return@forEach
+            ledger.observe(mark, entry.stacks, LabyrinthRelicStackSource.MAP,
+                entry.slotId, entry.evidenceId, entry.capturedAtMillis)
         }
     }
 
-    private fun advanceRelicStackCalibrationAfterAcquisition(relic: LabyrinthRelicMatch) {
-        val mark = LabyrinthRelicMark.fromLabel(relic.attribute) ?: return
-        val bonus = relic.attributeBonus?.trim()?.toIntOrNull()?.takeIf { it > 0 } ?: return
-        val fallback = relicChoicePolicy.markStacks(_state.value.observedRelics).getValue(mark)
-        relicStackLedger.acquired(mark, bonus, fallback)
+    private fun observeRelicIdentities(result: LabyrinthEntryFrameResult, timestampMillis: Long) {
+        val relics = when (result.observation.state) {
+            LabyrinthEntryPageState.RELIC_CHOICE -> result.relicChoiceSelection?.choices.orEmpty()
+            LabyrinthEntryPageState.SHOP -> result.shopObservation?.items.orEmpty().mapNotNull { it.relicMatch }
+            LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION -> listOfNotNull(result.shopObservation?.purchaseCandidate)
+            else -> emptyList()
+        }
+        relicIdentityGate.observe(result.observation.state, timestampMillis, relics)
+        val reward = result.relicRewardObservation?.takeIf {
+            it.kind == LabyrinthRelicRewardKind.RELIC_EFFECT && it.titleConfirmed &&
+                result.relicEvidenceVersion == relicEvidenceVersion && it.capturedAtMillis > relicEvidenceAfterMillis
+        }
+        relicRewardIdentityGate.observe(result.observation.state, timestampMillis, reward?.relics.orEmpty())
+        if (result.relicRewardObservation == null) {
+            relicRewardHoldSince = Long.MIN_VALUE
+            relicRewardRows = emptySet()
+            relicRewardLayoutSignature = null
+            relicRewardLayoutConfirmations = 0
+            relicRewardFrameAt = Long.MIN_VALUE
+        } else if (timestampMillis > relicRewardFrameAt) {
+            relicRewardRows = relicRewardRows + reward?.rowSlots.orEmpty()
+            val complete = reward != null && reward.layoutComplete && reward.rowSlots.isNotEmpty() && reward.rowSlots == relicRewardRows
+            val signature = reward?.takeIf { complete }?.let(::relicRewardSignature)
+            relicRewardLayoutConfirmations = if (signature == null) 0
+                else if (signature == relicRewardLayoutSignature) relicRewardLayoutConfirmations + 1 else 1
+            relicRewardLayoutSignature = signature
+            relicRewardFrameAt = timestampMillis
+        }
+    }
+
+    private fun relicRewardSignature(reward: LabyrinthRelicRewardObservation): String =
+        "${reward.kind}:${reward.rowSlots.sorted()}:${reward.relics.map { it.slotId to it.relicId }}"
+
+    private fun relicRewardReady(reward: LabyrinthRelicRewardObservation): Boolean =
+        reward.kind == LabyrinthRelicRewardKind.RELIC_EFFECT && reward.titleConfirmed && reward.layoutComplete &&
+            reward.rowSlots.isNotEmpty() && reward.rowSlots == relicRewardRows &&
+            relicRewardLayoutConfirmations >= 2 && relicRewardSignature(reward) == relicRewardLayoutSignature &&
+            reward.relics.all(relicRewardIdentityGate::confirmed)
+
+    private fun holdRelicRewardReceipt(sessionId: AutomationSessionId, result: LabyrinthEntryFrameResult, atMillis: Long): Boolean {
+        val reward = result.relicRewardObservation ?: return false
+        if (relicRewardHoldSince == Long.MIN_VALUE) relicRewardHoldSince = atMillis
+        val recordedIds = _state.value.observedRelics.map { it.relicId }.toSet()
+        if (relicRewardReady(reward) && reward.relics.all { it.relicId in recordedIds }) return false
+        _state.value = _state.value.copy(message = "正在识别并记录奖励遗物，暂不关闭弹窗")
+        overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
+        if (atMillis - relicRewardHoldSince >= 8_000L && !_state.value.dryRun) {
+            requestStopAfterFailure(sessionId, "奖励遗物未能完整确认，保留弹窗供核对")
+        }
+        return true
+    }
+
+    private fun invalidateRelicEvidence(atMillis: Long) {
+        relicEvidenceVersion++
+        relicEvidenceAfterMillis = atMillis
+        lastRelicMapRereadAt = Long.MIN_VALUE
+        relicMapRereads = 0
+    }
+
+    private fun applyRelicCancellations(ledger: LabyrinthRelicStackLedger) {
+        while (true) {
+            val cancelled = cancelledRelicAcquisitions.poll() ?: break
+            if (cancelled.sessionId == activeSessionId && cancelled.startedAt == activeRunStartedAt) ledger.cancel(cancelled.relicId)
+        }
+    }
+
+    private fun prepareRelicAcquisition(relic: LabyrinthRelicMatch): Boolean {
+        val id = relic.relicId ?: return false
+        if (_state.value.observedRelics.any { it.relicId == id }) return false
+        val mark = LabyrinthRelicMark.fromLabel(relic.attribute) ?: return false
+        val bonus = relic.attributeBonus?.trim()?.toIntOrNull()?.takeIf { it > 0 } ?: return false
+        val fallback = if (openingRelicBaselineKnown) relicChoicePolicy.markStacks(_state.value.observedRelics).getValue(mark) else null
+        return relicStackLedger.prepare(id, mark, bonus, fallback)
     }
 
     /** Evaluates role reward identity/choice in both dry-run and live sessions. */
@@ -3018,81 +3242,131 @@ class LabyrinthEntryRecognitionSession(
         _state.value = _state.value.copy(eventChoiceDecision = decision, message = message)
     }
 
-    private fun persistObservation(
+    private suspend fun persistObservation(
         sessionId: AutomationSessionId,
         result: LabyrinthEntryFrameResult,
         timestampMillis: Long,
-    ) {
-        val store = runStateStore ?: return
+        stagedRelics: LabyrinthRelicStackLedger,
+    ): Boolean {
+        val store = runStateStore
         val accountId = activeRunAccountId
-        if (
-            result.observation.state == LabyrinthEntryPageState.INITIAL_CHARACTER_SELECTION &&
-                !labyrinthIsRoleRewardPage(result) &&
-                openingStateReset.compareAndSet(false, true)
-        ) {
-            lastPersistedObservationSignature = null
-            relicFocusMark = null
-            relicStackLedger.clear()
-            pendingRelicSelection = null
-            relicChoiceCommitted = false
-            relicChoiceCommittedAt = Long.MIN_VALUE
-            relicChoiceCommitAttempts = 0
-            actionScope.launch {
-                runCatching {
-                    persistenceMutex.withLock { store.startNew(accountId, timestampMillis) }
+        val expectedStartedAt = activeRunStartedAt
+        val reward = result.relicRewardObservation
+        val initialSelection = result.observation.state == LabyrinthEntryPageState.INITIAL_CHARACTER_SELECTION && !labyrinthIsRoleRewardPage(result)
+        val fixedOpening = if (initialSelection) openingRelicCatalog.grants(
+            validatedRoute?.openingRelics?.takeIf { it.guildId == validatedRoute?.guildId },
+            EntryPixelRect(0, 0, maxOf(1, result.frameWidth), maxOf(1, result.frameHeight)),
+        ) else LabyrinthOpeningRelicGrant(emptyList(), false)
+        if (initialSelection && openingStateReset.compareAndSet(false, true)) {
+            return try {
+                persistenceMutex.withLock {
+                    if (activeSessionId != sessionId || activeRunStartedAt != expectedStartedAt) return@withLock false
+                    val started = store?.startNew(accountId, timestampMillis)
+                    val openingLedger = LabyrinthRelicStackLedger()
+                    val grants = LabyrinthRelicMerger.merge(emptyList(), fixedOpening.relics, timestampMillis)
+                    val totals = if (fixedOpening.complete) relicChoicePolicy.markStacks(grants) else null
+                    fixedOpening.relics.forEach { relic ->
+                        val mark = LabyrinthRelicMark.fromLabel(relic.attribute)
+                        openingLedger.received(requireNotNull(relic.relicId), mark,
+                            relic.attributeBonus?.toIntOrNull() ?: 0, timestampMillis, mark?.let { totals?.get(it) })
+                    }
+                    val snapshot = if (store != null && started != null) {
+                        store.recordPage(accountId, result.observation.state.name, emptyList(), timestampMillis,
+                            relics = fixedOpening.relics, expectedStartedAt = started.startedAt, relicStacks = openingLedger.records,
+                            openingRelicReceipt = validatedRoute?.let { LabyrinthOpeningRelicReceipt(it.enterId, fixedOpening.complete) })
+                    } else started
+                    if (activeSessionId != sessionId || activeRunStartedAt != expectedStartedAt) return@withLock false
+                    activeRunStartedAt = snapshot?.startedAt
+                    openingRelicBaselineKnown = fixedOpening.complete
+                    lastPersistedObservationSignature = null
+                    relicFocusMark = null
+                    if (snapshot != null) openingLedger.acceptCommitted(snapshot.relicStacks)
+                    relicStackLedger = openingLedger
+                    cancelledRelicAcquisitions.clear()
+                    relicIdentityGate.clear()
+                    relicRewardIdentityGate.clear()
+                    invalidateRelicEvidence(timestampMillis)
+                    pendingRelicSelection = null
+                    relicChoiceCommitted = false
+                    relicChoiceCommittedAt = Long.MIN_VALUE
+                    relicChoiceCommitAttempts = 0
+                    relicAcquisitionGate.reset()
+                    _state.value = _state.value.copy(
+                        joinedCharacters = snapshot?.joinedCharacters.orEmpty(),
+                        observedRelics = snapshot?.observedRelics ?: grants,
+                    )
+                    true
                 }
-                    .onSuccess { snapshot ->
-                        if (activeSessionId == sessionId) {
-                            _state.value = _state.value.copy(
-                                joinedCharacters = snapshot.joinedCharacters,
-                                observedRelics = snapshot.observedRelics,
-                            )
-                            overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
-                        }
-                    }
-                    .onFailure { failure ->
-                        if (activeSessionId == sessionId) {
-                            _state.value = _state.value.copy(message = "清理旧队伍状态失败：${failure.message ?: "未知错误"}")
-                        }
-                    }
+            } catch (failure: Exception) {
+                if (failure is kotlinx.coroutines.CancellationException) throw failure
+                if (activeSessionId == sessionId) requestStopAfterFailure(sessionId, "清理旧局记录失败：${failure.message}")
+                false
             }
-            return
         }
         val shopDialogState = result.shopObservation?.dialogState
         val purchasedRelic = when (shopDialogState) {
             LabyrinthShopDialogState.PURCHASE_CONFIRMATION -> {
+                shopConfirmClosedFrames = 0
+                shopConfirmClosedAt = Long.MIN_VALUE
                 // Only a transaction explicitly planned as a relic is eligible for relic
                 // persistence. Role-imprint icons can resemble relic templates and must never be
                 // written into the relic ledger after their purchase-complete modal.
                 pendingShopPurchase = plannedShopPurchaseRelicId?.let { plannedId ->
-                    result.shopObservation.purchaseCandidate?.takeIf { it.relicId == plannedId }
+                    result.shopObservation.purchaseCandidate?.takeIf { it.relicId == plannedId && relicIdentityGate.confirmed(it) }
+                        ?: pendingShopPurchase?.takeIf { it.relicId == plannedId }
                 }
                 null
             }
 
             LabyrinthShopDialogState.PURCHASE_COMPLETE -> {
+                // 购买完成弹窗出现即证明这次确认不是取消，状态全部归零。
+                shopConfirmClosedFrames = 0
+                shopConfirmClosedAt = Long.MIN_VALUE
                 pendingShopPurchase.also { pendingShopPurchase = null }
             }
 
             LabyrinthShopDialogState.NONE -> {
                 if (lastShopDialogState == LabyrinthShopDialogState.PURCHASE_CONFIRMATION) {
-                    // Returning directly to the shop means the confirmation was cancelled.
-                    pendingShopPurchase = null
-                    clearPlannedShopPurchase()
+                    // 买到东西后游戏常常先闪一帧「商店 + 无弹窗」，紧接着才弹「购买完成」。
+                    // 这一帧只记账，不清计划；否则随后的完成弹窗会被当成人工购买而永远不关
+                    // （2026-11-05 实测：卡在 SHOP_PURCHASE_COMPLETE 76 帧）。
+                    shopConfirmClosedFrames = 1
+                    shopConfirmClosedAt = clock()
+                } else if (shopConfirmClosedFrames > 0) {
+                    shopConfirmClosedFrames++
+                    if (
+                        shopConfirmClosedFrames >= SHOP_CONFIRM_CANCEL_FRAMES &&
+                        clock() - shopConfirmClosedAt >= SHOP_CONFIRM_CANCEL_GRACE_MILLIS
+                    ) {
+                        // 连续多帧、且超过时间窗都回到「商店 + 无弹窗」：这次确认确实被取消了。
+                        stagedRelics.cancel(plannedShopPurchaseRelicId)
+                        pendingShopPurchase = null
+                        clearPlannedShopPurchase()
+                        shopConfirmClosedFrames = 0
+                        shopConfirmClosedAt = Long.MIN_VALUE
+                    }
                 }
                 null
             }
 
             LabyrinthShopDialogState.EXIT_CONFIRMATION -> {
+                stagedRelics.cancel(plannedShopPurchaseRelicId)
+                clearPlannedShopPurchase()
+                shopConfirmClosedFrames = 0
+                shopConfirmClosedAt = Long.MIN_VALUE
                 pendingShopPurchase = null
                 null
             }
             null -> {
-                pendingShopPurchase = null
+                if (plannedShopPurchaseRelicId == null) {
+                    shopConfirmClosedFrames = 0
+                    shopConfirmClosedAt = Long.MIN_VALUE
+                    pendingShopPurchase = null
+                }
                 null
             }
         }
-        lastShopDialogState = shopDialogState ?: LabyrinthShopDialogState.NONE
+        if (shopDialogState != null) lastShopDialogState = shopDialogState
         val reconciled = labyrinthRosterReconciliationMatches(result)
         val characters = if (labyrinthRosterReplacesExisting(result, reconciled)) {
             // The three confirmed picks replace the roster; add the guild's automatic grant
@@ -3104,7 +3378,11 @@ class LabyrinthEntryRecognitionSession(
         } else {
             reconciled
         }
-        val confirmedRelic = if (relicAcquisitionGate.observe(relicChoiceCommitted, result.observation.state)) {
+        val confirmedRelic = if (relicAcquisitionGate.observe(
+                relicChoiceCommitted && timestampMillis > relicChoiceCommittedAt,
+                result.observation.state,
+                timestampMillis,
+            )) {
             pendingRelicSelection.also {
                 pendingRelicSelection = null
                 relicChoiceCommitted = false
@@ -3115,14 +3393,27 @@ class LabyrinthEntryRecognitionSession(
         } else {
             null
         }
-        val relics = when {
-            confirmedRelic != null -> listOf(confirmedRelic)
-            purchasedRelic != null -> listOf(purchasedRelic)
-            else -> emptyList()
-        }
-        relics.forEach(::advanceRelicStackCalibrationAfterAcquisition)
+        val receiptRelics = reward?.takeIf {
+            relicRewardReady(it) && it.capturedAtMillis > relicEvidenceAfterMillis && result.relicEvidenceVersion == relicEvidenceVersion
+        }?.relics.orEmpty()
+        val directRelics = (fixedOpening.relics + receiptRelics).distinctBy { it.relicId }
+        val relics = (listOfNotNull(confirmedRelic, purchasedRelic) + directRelics).distinctBy { it.relicId }
+        val acquired = listOfNotNull(confirmedRelic, purchasedRelic).mapNotNull { it.relicId }
+            .map { stagedRelics.acquired(it, timestampMillis) }.any { it }
+        val finalRelics = LabyrinthRelicMerger.merge(_state.value.observedRelics, relics, timestampMillis)
+        val historyTotals = if (fixedOpening.complete || openingRelicBaselineKnown) relicChoicePolicy.markStacks(finalRelics) else null
+        val received = directRelics.map { relic ->
+            val mark = LabyrinthRelicMark.fromLabel(relic.attribute)
+            stagedRelics.received(requireNotNull(relic.relicId), mark,
+                relic.attributeBonus?.toIntOrNull() ?: 0, timestampMillis, mark?.let { historyTotals?.get(it) })
+        }.any { it }
+        val persistedPage = result.observation.state.name
+        val openingReceipt = if (initialSelection) validatedRoute?.let {
+            LabyrinthOpeningRelicReceipt(it.enterId, fixedOpening.complete || openingRelicBaselineKnown)
+        } else null
         val signature = buildString {
-            append(result.observation.state.name)
+            append(persistedPage)
+            append(";opening=").append(openingReceipt)
             characters.forEach { character ->
                 append('|')
                 append(character.slotId)
@@ -3139,60 +3430,59 @@ class LabyrinthEntryRecognitionSession(
                 append(':')
                 append(relic.attribute)
             }
-        }
-        if (signature == lastPersistedObservationSignature) return
-        lastPersistedObservationSignature = signature
-        actionScope.launch {
-            runCatching {
-                persistenceMutex.withLock {
-                    store.recordPage(
-                        accountId = accountId,
-                        page = result.observation.state.name,
-                        characters = characters,
-                        nowMillis = timestampMillis,
-                        relics = relics,
-                        replaceCharacters = labyrinthRosterReplacesExisting(result, reconciled),
-                    )
-                }
-            }.onSuccess { snapshot ->
-                if (activeSessionId == sessionId) {
-                    if (characters.isNotEmpty()) {
-                        val confirmedIds = characters.mapNotNull { it.characterId }
-                            .map(::canonicalLabyrinthRoleId)
-                            .toSet()
-                        synchronized(pendingAcquiredCharacterIds) {
-                            pendingAcquiredCharacterIds.removeAll { pendingId ->
-                                canonicalLabyrinthRoleId(pendingId) in confirmedIds
-                            }
-                            pendingAcquiredCharacterId = pendingAcquiredCharacterIds.firstOrNull()
-                        }
-                    }
-                    _state.value = _state.value.copy(
-                        joinedCharacters = snapshot.joinedCharacters,
-                        observedRelics = snapshot.observedRelics,
-                        pendingAcquiredCharacterId = pendingAcquiredCharacterId,
-                        message = confirmedRelic?.displayName?.let { "选择遗物已入库：$it" }
-                            ?: purchasedRelic?.displayName?.let { "购买遗物已入库：$it" }
-                            ?: "页面识别已更新",
-                    )
-                    pendingAcquiredCharacterId = _state.value.pendingAcquiredCharacterId
-                    refreshBattleTeamRecommendation(
-                        sessionId,
-                        _state.value.lastResult?.observation?.state ?: LabyrinthEntryPageState.UNKNOWN,
-                    )
-                    refreshBattleTeamSelectionPlan(
-                        sessionId = sessionId,
-                        pageState = _state.value.lastResult?.observation?.state ?: LabyrinthEntryPageState.UNKNOWN,
-                        observation = _state.value.lastResult?.battleTeamSelection,
-                    )
-                    overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
-                }
-            }.onFailure { failure ->
-                lastPersistedObservationSignature = null
-                if (activeSessionId == sessionId) {
-                    _state.value = _state.value.copy(message = "保存本局队伍/遗物失败：${failure.message ?: "未知错误"}")
-                }
+            stagedRelics.records.toSortedMap(compareBy { it.name }).forEach { (mark, record) ->
+                append("|${mark.name}:${record.stacks}:${record.source.name}")
             }
+        }
+        if (signature == lastPersistedObservationSignature) {
+            if (activeSessionId != sessionId || activeRunStartedAt != expectedStartedAt) return false
+            applyRelicCancellations(stagedRelics)
+            relicStackLedger = stagedRelics
+            return true
+        }
+        return try {
+            persistenceMutex.withLock {
+                if (activeSessionId != sessionId || activeRunStartedAt != expectedStartedAt) return@withLock false
+                val snapshot = store?.recordPage(
+                    accountId = accountId,
+                    page = persistedPage,
+                    characters = characters,
+                    nowMillis = timestampMillis,
+                    relics = relics,
+                    replaceCharacters = labyrinthRosterReplacesExisting(result, reconciled),
+                    expectedStartedAt = expectedStartedAt,
+                    relicStacks = stagedRelics.records,
+                    openingRelicReceipt = openingReceipt,
+                )
+                if (activeSessionId != sessionId || activeRunStartedAt != expectedStartedAt) return@withLock false
+                applyRelicCancellations(stagedRelics)
+                if (snapshot != null) stagedRelics.acceptCommitted(snapshot.relicStacks)
+                relicStackLedger = stagedRelics
+                lastPersistedObservationSignature = signature
+                if (fixedOpening.complete) openingRelicBaselineKnown = true
+                if (acquired || received) invalidateRelicEvidence(timestampMillis)
+                if (characters.isNotEmpty()) {
+                    val confirmedIds = characters.mapNotNull { it.characterId }.map(::canonicalLabyrinthRoleId).toSet()
+                    synchronized(pendingAcquiredCharacterIds) {
+                        pendingAcquiredCharacterIds.removeAll { canonicalLabyrinthRoleId(it) in confirmedIds }
+                        pendingAcquiredCharacterId = pendingAcquiredCharacterIds.firstOrNull()
+                    }
+                }
+                _state.value = _state.value.copy(
+                    joinedCharacters = snapshot?.joinedCharacters ?: LabyrinthRosterMerger.merge(
+                        _state.value.joinedCharacters, characters, timestampMillis, labyrinthRosterReplacesExisting(result, reconciled)),
+                    observedRelics = snapshot?.observedRelics ?: LabyrinthRelicMerger.merge(_state.value.observedRelics, relics, timestampMillis),
+                    pendingAcquiredCharacterId = pendingAcquiredCharacterId,
+                )
+                true
+            }
+        } catch (failure: Exception) {
+            if (failure is kotlinx.coroutines.CancellationException) throw failure
+            if (activeSessionId == sessionId) {
+                lastPersistedObservationSignature = null
+                requestStopAfterFailure(sessionId, "保存本局队伍/遗物失败：${failure.message ?: "未知错误"}")
+            }
+            false
         }
     }
 
@@ -3303,7 +3593,6 @@ class LabyrinthEntryRecognitionSession(
             resetEventChoiceCommit()
         }
         if (labyrinthPageUiOwner(pageState) != LabyrinthPageUiOwner.SHOP) {
-            pendingShopPurchase = null
             val keepPurchaseTransition = labyrinthKeepsPlannedShopPurchaseAcrossPage(
                 pageState = pageState,
                 plannedRelicId = plannedShopPurchaseRelicId ?: plannedShopRoleImprintLabel,
@@ -3312,6 +3601,7 @@ class LabyrinthEntryRecognitionSession(
                 timeoutMillis = SHOP_PURCHASE_TRANSITION_TIMEOUT_MILLIS,
             )
             if (!keepPurchaseTransition) {
+                pendingShopPurchase = null
                 clearPlannedShopPurchase()
                 lastShopDialogState = LabyrinthShopDialogState.NONE
             }
@@ -4055,6 +4345,11 @@ class LabyrinthEntryRecognitionSession(
             }
             when (result) {
                 is AutomationActionResult.Executed -> {
+                    if (activeSessionId == sessionId && decision.kind == LabyrinthEntryActionKind.START_DAWN_REALM) {
+                        initialStartExecuted = true
+                        openingStateReset.set(false)
+                        openingRelicBaselineKnown = false
+                    }
                     if (decision.kind == LabyrinthEntryActionKind.RESUME_DAWN_REALM) {
                         // The next page may be the node map, a choice page, or an unfinished
                         // CHARACTER_JOINED reward from before the app/session was restarted.
@@ -4189,6 +4484,7 @@ class LabyrinthEntryRecognitionSession(
             lockedFocus = relicFocusMark,
             relicPurchasesInCycle = shopRelicPurchasesThisCycle,
             refreshAvailabilityKnown = refreshAnchorReady,
+            refreshesUsedInVisit = shopRefreshesThisVisit,
         )
     }
 
@@ -5033,7 +5329,8 @@ class LabyrinthEntryRecognitionSession(
             postEntryAttempts = 0
             resetPostEntryStall()
             resetEventChoiceCommit()
-            if (pageState == LabyrinthEntryPageState.RELIC_CHOICE) {
+            if (pageState == LabyrinthEntryPageState.RELIC_CHOICE && !relicChoiceCommitted) {
+                relicStackLedger.cancel(pendingRelicSelection?.relicId)
                 pendingRelicSelection = null
                 relicChoiceCommitted = false
                 relicChoiceCommittedAt = Long.MIN_VALUE
@@ -5556,6 +5853,7 @@ class LabyrinthEntryRecognitionSession(
                         relicChoiceCommitted = false
                         relicChoiceCommittedAt = Long.MIN_VALUE
                         relicChoiceCommitAttempts++
+                        relicStackLedger.cancel(pendingRelicSelection?.relicId)
                         pendingRelicSelection = null
                         nodeLog("relic-choice-retry attempts=$relicChoiceCommitAttempts", warning = true)
                     }
@@ -5566,6 +5864,15 @@ class LabyrinthEntryRecognitionSession(
                         calibratedStacks = relicMarkStackCalibration,
                         currentArea = _state.value.routeProgress?.currentArea,
                     )?.let { decision ->
+                        if (!relicIdentityGate.confirmed(decision.choice)) return@let null
+                        val mark = LabyrinthRelicMark.fromLabel(decision.choice.attribute)
+                        val cardConfirmed = decision.choice.currentMarkStacks != null &&
+                            decision.choice.currentMarkStacksConfirmations >= 2 &&
+                            decision.choice.currentMarkStacksCapturedAtMillis > relicEvidenceAfterMillis &&
+                            relicMarkStackCalibration[mark] == decision.choice.currentMarkStacks
+                        if (!cardConfirmed && relicIdentityGate.calibrationGraceOpen(timestampMillis)) return@let null
+                        if (pendingRelicSelection?.relicId != decision.choice.relicId) relicStackLedger.cancel(pendingRelicSelection?.relicId)
+                        if (!prepareRelicAcquisition(decision.choice)) return@let null
                         if (decision.phase != LabyrinthRelicChoicePhase.BUILD_BASELINE) {
                             relicFocusMark = decision.focusMark
                         }
@@ -5617,9 +5924,13 @@ class LabyrinthEntryRecognitionSession(
                         nodeLog("event-choice-refused id=$rejected rejected=$eventChoiceRejectedIds", warning = true)
                     }
                     eventChoiceCommittedChoiceId = null
+                    if (eventCustomizationEnabledSnapshot) refreshEventChoiceDecision(sessionId, result)
                 }
                 when (val decision = _state.value.eventChoiceDecision) {
-                    is LabyrinthEventChoiceDecision.Select -> if (decision.actionSafe) {
+                    is LabyrinthEventChoiceDecision.Select -> if (
+                        decision.actionSafe &&
+                            (!eventCustomizationEnabledSnapshot || decision.choiceId !in eventChoiceRejectedIds)
+                    ) {
                         LabyrinthPostEntryTapPlan(
                             LabyrinthPostEntryActionKind.SELECT_EVENT,
                             "选择事件：${decision.choiceId} ${decision.label}；${decision.explanation}",
@@ -5629,7 +5940,9 @@ class LabyrinthEntryRecognitionSession(
                         null
                     }
                     is LabyrinthEventChoiceDecision.Wait -> null
-                    null -> labyrinthSingleChoiceEventButtonRect(result)?.let { rect ->
+                    null -> labyrinthSingleChoiceEventButtonRect(
+                        result, eventCustomizationEnabled = eventCustomizationEnabledSnapshot,
+                    )?.let { rect ->
                         nodeLog("event-choice-fallback source=SINGLE_CHOICE_ANCHORS rect=$rect " +
                             "layoutCount=${result.eventOcrDiagnostics?.completeLayoutCount} " +
                             "ocr=${result.eventOcrDiagnostics?.status} " +
@@ -5646,19 +5959,27 @@ class LabyrinthEntryRecognitionSession(
             LabyrinthEntryPageState.SHOP -> when (val decision = currentShopDecision(result)) {
                 is LabyrinthShopDecision.BuyRelic -> {
                     val relic = decision.relicDecision.choice
-                    if (decision.relicDecision.phase != LabyrinthRelicChoicePhase.BUILD_BASELINE) {
-                        relicFocusMark = decision.relicDecision.focusMark
+                    if (plannedShopPurchaseRelicId != relic.relicId) relicStackLedger.cancel(plannedShopPurchaseRelicId)
+                    if (!relicIdentityGate.confirmed(relic) || !prepareRelicAcquisition(relic)) {
+                        shopWaitReason = "正在复核待购买遗物身份"
+                        null
+                    } else {
+                        if (decision.relicDecision.phase != LabyrinthRelicChoicePhase.BUILD_BASELINE) {
+                            relicFocusMark = decision.relicDecision.focusMark
+                        }
+                        plannedShopRoleImprintLabel = null
+                        plannedShopPurchaseRelicId = relic.relicId
+                        LabyrinthPostEntryTapPlan(
+                            LabyrinthPostEntryActionKind.SHOP_BUY_RELIC,
+                            "购买遗物：${relic.displayName ?: relic.relicId}；${decision.relicDecision.reason}",
+                            decision.item.buyButtonRect,
+                        )
                     }
-                    plannedShopRoleImprintLabel = null
-                    plannedShopPurchaseRelicId = relic.relicId
-                    LabyrinthPostEntryTapPlan(
-                        LabyrinthPostEntryActionKind.SHOP_BUY_RELIC,
-                        "购买遗物：${relic.displayName ?: relic.relicId}；${decision.relicDecision.reason}",
-                        decision.item.buyButtonRect,
-                    )
                 }
 
                 is LabyrinthShopDecision.BuyRoleImprint -> {
+                    relicStackLedger.cancel(plannedShopPurchaseRelicId)
+                    pendingShopPurchase = null
                     plannedShopPurchaseRelicId = null
                     plannedShopRoleImprintLabel = decision.label
                     // A 选择印记 opens the roster picker once the purchase completes; a 随机印记
@@ -5739,6 +6060,10 @@ class LabyrinthEntryRecognitionSession(
                     }
                     candidate?.relicId == null -> {
                         shopWaitReason = "购买确认弹窗中的遗物尚未可靠识别，拒绝自动确认"
+                        null
+                    }
+                    !relicIdentityGate.confirmed(candidate) -> {
+                        shopWaitReason = "正在复读购买确认中的遗物身份"
                         null
                     }
                     candidate.relicId != plannedId -> {
@@ -6259,6 +6584,8 @@ class LabyrinthEntryRecognitionSession(
         specialEquipmentStepStartedAt = Long.MIN_VALUE
         specialEquipmentAwayFrames = 0
         specialEquipmentPendingEscape = null
+        specialEquipmentEscapeSpentStages.clear()
+        specialEquipmentStepLastDispatchAt = Long.MIN_VALUE
         specialEquipmentEscapeDeadline = Long.MIN_VALUE
         specialEquipmentDiagnostic = null
         specialEquipmentAbandoned = false
@@ -6266,6 +6593,20 @@ class LabyrinthEntryRecognitionSession(
         specialEquipmentModalCloseSettlePending = false
         specialEquipmentEquipEvidence = LabyrinthSpecialEquipmentEquipEvidenceStreak()
         specialEquipmentRoundBossTeamIndex = null
+    }
+
+    /**
+     * 本轮特别装备是否正等着弹窗1/弹窗2 出现。
+     *
+     * 这几步里画面会被弹窗本身或它的显现动画占据；与这两个弹窗共用面板外观的「系列效果一览」持帧判定
+     * 不能把这种帧拿走——拿走了流程只能干等下一帧，而弹窗的显现往往只持续一两帧。
+     */
+    private fun specialEquipmentAwaitsDialog(): Boolean = when (specialEquipmentFlowStage) {
+        LabyrinthSpecialEquipmentFlowStage.AWAIT_MAIN_DIALOG,
+        LabyrinthSpecialEquipmentFlowStage.AWAIT_AUTO_DIALOG,
+        LabyrinthSpecialEquipmentFlowStage.AWAIT_SECOND_MAIN_DIALOG,
+        -> true
+        else -> false
     }
 
     /** 当前页签的队伍成员：每个槽位一个 `characterId`，未识别的槽位是 null。 */
@@ -6424,6 +6765,7 @@ class LabyrinthEntryRecognitionSession(
             specialEquipmentFlowStage = LabyrinthSpecialEquipmentFlowStage.AWAIT_ENTRY
             specialEquipmentStepAttempts = 0
             specialEquipmentStepStartedAt = timestampMillis
+            specialEquipmentStepLastDispatchAt = Long.MIN_VALUE
             specialEquipmentRoundBossTeamIndex = bossTeamIndex.takeIf { bossMultiTeamTab }
         }
 
@@ -6443,12 +6785,21 @@ class LabyrinthEntryRecognitionSession(
         )
         specialEquipmentEquipEvidence = equipEvidence
 
+        // 本步距离上一次**真正派发**过去了多久：决策用它给「点「自动装备」后等弹窗2」限速
+        // （未知 ⇒ 视为很久以前，首帧/换步之后立刻可点）。
+        val sinceLastStepDispatchMillis = if (specialEquipmentStepLastDispatchAt == Long.MIN_VALUE) {
+            Long.MAX_VALUE
+        } else {
+            (timestampMillis - specialEquipmentStepLastDispatchAt).coerceAtLeast(0L)
+        }
+
         val decision = labyrinthSpecialEquipmentDecision(
             stage = specialEquipmentFlowStage,
             observation = observation,
             stepAttempts = specialEquipmentStepAttempts,
             stepElapsedMillis = stepElapsedMillis,
             equipConfirmEnabled = equipEvidence.confirmedEnabled,
+            sinceLastStepDispatchMillis = sinceLastStepDispatchMillis,
         )
         // 只在本轮真正（武装后）看到过弹窗的帧上记账：用户手动打开的弹窗不引入任何新等待。
         if (dialogOpen) specialEquipmentDialogObserved = true
@@ -6463,8 +6814,13 @@ class LabyrinthEntryRecognitionSession(
                 if (specialEquipmentDiagnostic == null) specialEquipmentDiagnostic = decision.message
                 specialEquipmentAbandoned = true
             }
-            if (decision.tap != null) {
-                specialEquipmentPendingEscape = decision.tap
+            val escapeStage = observation?.stage
+            if (decision.tap != null && escapeStage != null) {
+                // 逃生点击绑定到**这一帧**还开着的那层弹窗：等间隔的这几帧里画面可能换层。
+                specialEquipmentPendingEscape = PendingSpecialEquipmentEscape(
+                    tap = decision.tap,
+                    dialogStage = escapeStage,
+                )
                 // 待办本身也有窗口：窗口内始终派发不出去（例如单动作锁一直被占）就放弃这次点击，
                 // 交给下面「本轮已结束但弹窗仍开着」的分支停机并保留诊断，不引入无界等待。
                 specialEquipmentEscapeDeadline =
@@ -6476,11 +6832,50 @@ class LabyrinthEntryRecognitionSession(
             specialEquipmentEscapeDeadline != Long.MIN_VALUE &&
             timestampMillis >= specialEquipmentEscapeDeadline
         ) {
+            specialEquipmentPendingEscape?.let { specialEquipmentEscapeSpentStages.add(it.dialogStage) }
             specialEquipmentPendingEscape = null
         }
+        val currentDialogStage = observation?.stage
+        // 待办的逃生点击只对它被决定时的那一层弹窗有效：画面已经换层就作废，改按当前这一层重挂。
+        if (
+            specialEquipmentPendingEscape != null &&
+            currentDialogStage != null &&
+            specialEquipmentPendingEscape?.dialogStage != currentDialogStage
+        ) {
+            specialEquipmentPendingEscape = null
+        }
+        // 本轮已经放弃、弹窗却还开着：按当前这一层重新挂一次逃生点击。两层各一次「取消」必然逐层退回
+        // 编组页（弹窗2 → 弹窗1 → 编组页）；同一层点过就不再点，两层都点过才走下面的停机分支。
+        if (
+            decision.finished &&
+            specialEquipmentAbandoned &&
+            specialEquipmentPendingEscape == null &&
+            currentDialogStage != null &&
+            observation.cancelButtonRect != null &&
+            currentDialogStage !in specialEquipmentEscapeSpentStages
+        ) {
+            specialEquipmentPendingEscape = PendingSpecialEquipmentEscape(
+                tap = LabyrinthSpecialEquipmentTap.CANCEL,
+                dialogStage = currentDialogStage,
+            )
+            specialEquipmentEscapeDeadline =
+                timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
+        }
 
-        val tap = decision.tap ?: specialEquipmentPendingEscape
-        val rect = tap?.let { current -> observation?.let { labyrinthSpecialEquipmentTapRect(current, it) } }
+        val pendingEscape = specialEquipmentPendingEscape
+        val tap = decision.tap ?: pendingEscape?.tap
+        // 本帧决策给出的点击就落在本帧观测的按钮上；待办的逃生点击只在同一层弹窗还开着时有效。
+        // 矩形一律从观测里取、不缓存坐标：换层之后不会把同一个「取消」重放到另一层的按钮上。
+        val currentObservation = observation
+        val deferredEscapeLayerMatches =
+            pendingEscape != null && currentDialogStage == pendingEscape.dialogStage
+        val rect = when {
+            tap == null -> null
+            currentObservation == null -> null
+            decision.tap != null -> labyrinthSpecialEquipmentTapRect(tap, currentObservation)
+            deferredEscapeLayerMatches -> labyrinthSpecialEquipmentTapRect(tap, currentObservation)
+            else -> null
+        }
         val tapReady = rect != null && sessionActionIntervalElapsed(timestampMillis)
         // **「决定要点击」不等于「点击已经派发」**：会话动作间隔（[BATTLE_TEAM_ACTION_INTERVAL_MILLIS]）
         // 与单动作锁都可能把这一下挡在派发之前。此时若把 stage 推进到下一状态，就等于宣布「已经点过
@@ -6575,10 +6970,12 @@ class LabyrinthEntryRecognitionSession(
         }
         if (decision.tap != null) {
             specialEquipmentStepAttempts++
+            specialEquipmentStepLastDispatchAt = timestampMillis
         }
         if (decision.finished) {
-            // 逃生点击**只点一次**——派发成功后立刻清待办，否则下一个动作间隔（≥1.2s）到来时残留的
-            // pendingEscape 会再点一次「取消」，与本段的语义和注释都不符。
+            // 逃生点击**每一层只点一次**——派发成功后立刻清待办并记下这一层，否则下一个动作间隔
+            // （≥1.2s）到来时残留的 pendingEscape 会再点一次「取消」，落到下一层或编组页的按钮上。
+            pendingEscape?.let { specialEquipmentEscapeSpentStages.add(it.dialogStage) }
             specialEquipmentPendingEscape = null
             specialEquipmentEscapeDeadline =
                 timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
@@ -6600,6 +6997,7 @@ class LabyrinthEntryRecognitionSession(
         if (decision.stage != specialEquipmentFlowStage) {
             specialEquipmentStepAttempts = 0
             specialEquipmentStepStartedAt = timestampMillis
+            specialEquipmentStepLastDispatchAt = Long.MIN_VALUE
         }
         specialEquipmentFlowStage = decision.stage
     }
@@ -6900,9 +7298,16 @@ class LabyrinthEntryRecognitionSession(
         eventFreeRoleConfirmIds: List<String> = emptyList(),
     ) {
         if (!beginGuardedAction()) return
+        val dispatchedEventChoiceId = if (eventCustomizationEnabledSnapshot &&
+            kind == LabyrinthPostEntryActionKind.SELECT_EVENT
+        ) {
+            (_state.value.eventChoiceDecision as? LabyrinthEventChoiceDecision.Select)
+                ?.takeIf { it.buttonRect == rect }?.choiceId
+        } else null
         val selectedReward = (_state.value.roleRewardChoiceDecision as? LabyrinthRoleRewardChoiceDecision.Select)
             ?.takeIf { it.characterId == roleRewardSelectedCharacterId && it.actionSafe }
         val selectedRewardAccountId = activeRunAccountId
+        val selectedRewardStartedAt = activeRunStartedAt
         val selectedRewardMatch = _state.value.lastResult?.characterMatches
             ?.firstOrNull { it.characterId == selectedReward?.characterId && it.trusted }
         if (shopPurchaseRelicId != null || shopPurchaseRoleImprintLabel != null) {
@@ -6937,6 +7342,7 @@ class LabyrinthEntryRecognitionSession(
             } else {
                 executor.execute(sessionId, tap)
             }
+            if (activeSessionId != sessionId || activeRunStartedAt != selectedRewardStartedAt) return@launchGuardedAction
             when (actionResult) {
                 is AutomationActionResult.Executed -> {
                     lastPostEntryActionLandedAt = clock()
@@ -6958,8 +7364,11 @@ class LabyrinthEntryRecognitionSession(
                     if (kind == LabyrinthPostEntryActionKind.SELECT_EVENT) {
                         eventChoiceCommitted = true
                         eventChoiceCommittedAt = clock()
-                        eventChoiceCommittedChoiceId =
+                        eventChoiceCommittedChoiceId = if (eventCustomizationEnabledSnapshot) {
+                            dispatchedEventChoiceId
+                        } else {
                             (_state.value.eventChoiceDecision as? LabyrinthEventChoiceDecision.Select)?.choiceId
+                        }
                     }
                     if (kind == LabyrinthPostEntryActionKind.SELECT_RELIC) {
                         relicChoiceCommitted = true
@@ -6981,30 +7390,30 @@ class LabyrinthEntryRecognitionSession(
                                 displayName = selected.displayName, confidence = ROLE_REWARD_STRONG_ICON_CONFIDENCE,
                                 screenRect = rect, trusted = true,
                             )
-                            val persisted = runCatching {
-                                persistenceMutex.withLock {
+                            persistenceMutex.withLock {
+                                if (activeSessionId != sessionId || activeRunStartedAt != selectedRewardStartedAt) return@withLock
+                                val persisted = runCatching {
                                     runStateStore?.recordPage(
                                         accountId = selectedRewardAccountId,
                                         page = LabyrinthEntryPageState.INITIAL_CHARACTER_SELECTION.name,
                                         characters = listOf(match), nowMillis = clock(),
+                                        expectedStartedAt = selectedRewardStartedAt,
                                     )
+                                }.onFailure {
+                                    if (it is kotlinx.coroutines.CancellationException) throw it
+                                    runCatching { Log.e("LabyrinthEntry", "Selected role persistence failed; retain joined recognition", it) }
                                 }
-                            }.onFailure {
-                                val failure = it
-                                runCatching {
-                                    Log.e("LabyrinthEntry", "Selected role persistence failed; retain joined recognition", failure)
-                                }
-                            }
-                            if (activeSessionId == sessionId) {
-                                _state.value = _state.value.copy(
-                                    joinedCharacters = persisted.getOrNull()?.joinedCharacters ?: LabyrinthRosterMerger.merge(
-                                        _state.value.joinedCharacters, listOf(match), clock(),
-                                    ),
-                                )
-                                skipRoleRewardJoinedRecognition = persisted.isSuccess
-                                synchronized(pendingAcquiredCharacterIds) {
-                                    pendingAcquiredCharacterIds.remove(selected.characterId)
-                                    pendingAcquiredCharacterId = pendingAcquiredCharacterIds.firstOrNull()
+                                if (activeSessionId == sessionId && activeRunStartedAt == selectedRewardStartedAt) {
+                                    _state.value = _state.value.copy(
+                                        joinedCharacters = persisted.getOrNull()?.joinedCharacters ?: LabyrinthRosterMerger.merge(
+                                            _state.value.joinedCharacters, listOf(match), clock(),
+                                        ),
+                                    )
+                                    skipRoleRewardJoinedRecognition = persisted.isSuccess
+                                    synchronized(pendingAcquiredCharacterIds) {
+                                        pendingAcquiredCharacterIds.remove(selected.characterId)
+                                        pendingAcquiredCharacterId = pendingAcquiredCharacterIds.firstOrNull()
+                                    }
                                 }
                             }
                         }
@@ -7070,6 +7479,7 @@ class LabyrinthEntryRecognitionSession(
                             // The refresh button opens a second confirmation dialog.  Keep the
                             // completed-cycle count until that dialog is confirmed and fresh shop
                             // stock is visible again.
+                            shopRefreshesThisVisit++
                             plannedShopRefreshStartedAt = clock()
                             plannedShopRefreshConfirmedAt = Long.MIN_VALUE
                             postEntryStableFrames = 0
@@ -7140,7 +7550,7 @@ class LabyrinthEntryRecognitionSession(
         }
     }
 
-    /** Only closing the final item popup and observing the idle maze home completes a run. */
+    /** Only the final item popup being closed and the idle maze home being visible completes a run. */
     private fun markRunCleared(sessionId: AutomationSessionId) {
         if (activeSessionId != sessionId) return
         postBossStage = LabyrinthPostBossStage.WAITING_FOR_DAWN_HOME
@@ -7179,6 +7589,7 @@ class LabyrinthEntryRecognitionSession(
         nodeInitFailedReason = null
         finalBossLocalizationStartedAt = Long.MIN_VALUE
         entryPhaseComplete = false
+        initialStartExecuted = false
         resetPendingNodeClickStability()
         resetStrongRouteTargetBinding()
         pendingNodeTransition = null
@@ -7209,6 +7620,18 @@ class LabyrinthEntryRecognitionSession(
         relicChoiceCommitAttempts = 0
         relicFocusMark = null
         relicStackLedger.clear()
+        relicIdentityGate.clear()
+        relicRewardIdentityGate.clear()
+        relicRewardHoldSince = Long.MIN_VALUE
+        relicRewardRows = emptySet()
+        relicRewardLayoutSignature = null
+        relicRewardLayoutConfirmations = 0
+        relicRewardFrameAt = Long.MIN_VALUE
+        openingRelicBaselineKnown = false
+        cancelledRelicAcquisitions.clear()
+        relicAcquisitionGate.reset()
+        activeRunStartedAt = null
+        invalidateRelicEvidence(clock())
         clearCharacterAcquisitionContext()
         clearRoleRewardBatchTracking()
         existingRunResumeHandoffArmed = false
@@ -7839,6 +8262,8 @@ class LabyrinthEntryRecognitionSession(
                         ?.nextNode
                         ?.takeIf { it.blockId == action.blockId }
                         ?.area
+                        // 区域号以节点编号为准：routeProgress 在区域边界会提前翻页，编号不会。
+                        ?: labyrinthNodeAreaOf(action.blockId)
                         ?: _state.value.routeProgress?.currentArea
                     prepareNodeTransitionContext(action.blockType, targetArea)
                     pendingNodeTransition = PendingNodeTransition(
@@ -7929,6 +8354,7 @@ class LabyrinthEntryRecognitionSession(
             // Reset only when entering a new shop node; purchase-animation page churn must not
             // erase this counter, but a recovered movement dialog represents a real new node.
             shopRelicPurchasesThisCycle = 0
+            shopRefreshesThisVisit = 0
             clearPlannedShopRefresh()
         }
         if (blockType == LabyrinthNodeTypes.BOSS) {
@@ -9035,15 +9461,20 @@ class LabyrinthEntryRecognitionSession(
                 if (relicMarkStackCalibration.isNotEmpty()) {
                     add("系列记录：" + relicMarkStackCalibration.entries.joinToString("、") { "${it.key.label}${it.value}" })
                 }
+                val unverifiedSeries = relicStackLedger.unverifiedMarks(clock())
+                if (unverifiedSeries.isNotEmpty()) {
+                    add("系列层数尚未复核：" + unverifiedSeries.joinToString("、") { it.label })
+                }
                 if (relicStackLedger.needsAudit) {
-                    add("地图数字与记录冲突，保留已确认值；可打开系列效果一览核对，不阻塞路线")
+                    add("系列层数待核对：" + relicStackLedger.auditMarks.joinToString("、") { it.label } +
+                        "；可用系列效果一览复核，不阻塞路线")
                 }
                 current.observedRelics
                     .takeIf(List<LabyrinthObservedRelic>::isNotEmpty)
                     ?.let { relics ->
                         add(
                             "已观察遗物：" + relics.joinToString("、") {
-                                "${it.displayName}[${it.attribute}]×${it.observationCount}"
+                                "${it.displayName}[${it.attribute}]"
                             },
                         )
                     }
@@ -9670,6 +10101,14 @@ class LabyrinthEntryRecognitionSession(
         /** Lost-tap retries allowed on a single-pick choice page before the run stops. */
         const val MAX_SELECTION_COMMIT_ATTEMPTS = 3
         const val SHOP_PURCHASE_TRANSITION_TIMEOUT_MILLIS = 8_000L
+        /**
+         * 确认弹窗关闭后，要连续看到这么多帧「商店 + 无弹窗」才认定是用户取消。
+         * 买到东西时游戏会先闪一帧商店再弹「购买完成」，设成 1 会误判并把购买计划清掉。
+         */
+        const val SHOP_CONFIRM_CANCEL_FRAMES = 2
+
+        /** 确认弹窗关闭后至少等这么久，才允许把「商店 + 无弹窗」当成取消（购买完成弹窗可能晚到）。 */
+        const val SHOP_CONFIRM_CANCEL_GRACE_MILLIS = 2_000L
         const val SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS = 8_000L
         const val SHOP_REFRESH_SETTLE_MILLIS = 500L
         const val CHARACTER_ACQUISITION_ACTION_INTERVAL_MILLIS = 650L

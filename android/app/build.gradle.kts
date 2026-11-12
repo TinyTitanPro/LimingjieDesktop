@@ -23,8 +23,8 @@ android {
         minSdk = 26
         targetSdk = 35
         // major*10000 + minor*100 + patch, so the code stays monotonic as the name moves.
-        versionCode = 10018
-        versionName = "1.0.18"
+        versionCode = 10074
+        versionName = "1.0.18-mod.V10.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

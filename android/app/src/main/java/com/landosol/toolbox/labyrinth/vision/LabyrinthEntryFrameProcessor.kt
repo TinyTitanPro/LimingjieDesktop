@@ -374,10 +374,12 @@ data class LabyrinthEntryFrameResult(
     val battleTeamSelection: LabyrinthBattleTeamObservation? = null,
     val linkChoiceSelection: LabyrinthLinkChoiceObservation? = null,
     val relicChoiceSelection: LabyrinthRelicChoiceObservation? = null,
+    val relicEvidenceVersion: Long = 0,
     val eventChoiceSelection: LabyrinthEventChoiceObservation? = null,
     val eventOcrDiagnostics: LabyrinthEventOcrDiagnostics? = null,
     val nodeRelicStackObservation: LabyrinthNodeRelicStackObservation? = null,
     val relicDetailObservation: LabyrinthRelicDetailObservation? = null,
+    val relicRewardObservation: LabyrinthRelicRewardObservation? = null,
     val shopObservation: LabyrinthShopObservation? = null,
     val nodeMoveConfirmation: LabyrinthNodeMoveConfirmationObservation? = null,
     val battleFailure: LabyrinthBattleFailureObservation? = null,
@@ -462,6 +464,18 @@ class LabyrinthEntryFrameProcessor(
      * the first consumed frame still benefits from a stable-viewport fast path.
      */
     private val nodeScanConsumable: () -> Boolean = { true },
+    /**
+     * Entry templates already scaled to each definition's rect for one concrete capture size,
+     * or null to keep the original per-score mapping.
+     *
+     * Built once at session start (see [EntryTemplatePrescaler]). Scoring with a template whose
+     * size equals its rect turns [GradientTemplateMatcher]'s coordinate mapping into the identity,
+     * which is what a non-1920x1080 capture needs; a table whose size does not match the frame is
+     * ignored rather than used, so a stale copy can never be scored.
+     */
+    private val preScaledTemplates: PreScaledEntryTemplates? = null,
+    /** Route context distinguishes real opening from the event/shop picker with the same shell. */
+    private val allowInitial1088GeometryRefinement: () -> Boolean = { false },
 ) {
     private val finalBossPlatformLocator = FinalBossPlatformLocator(
         nodeTemplates.templates["node.boss.platform"],
@@ -517,6 +531,8 @@ class LabyrinthEntryFrameProcessor(
         var nodeViewportSignature = ""
         var nodeViewportPixels: com.landosol.toolbox.labyrinth.node.NodeViewportPixels? = null
         val elapsedNanos = measureNanoTime {
+            val preScaled = preScaledTemplates
+                ?.takeIf { it.frameWidth == frame.width && it.frameHeight == frame.height }
             val measurements = DEFINITIONS_BY_ID.mapValues { (id, definitions) ->
                 val template = templates.values[id]
                     ?: return@mapValues null
@@ -537,7 +553,11 @@ class LabyrinthEntryFrameProcessor(
                     }
                     mapped?.let { rect ->
                         EntryAnchorMatch(
-                            score = matcher.score(frame, rect, template),
+                            score = matcher.score(
+                                frame,
+                                rect,
+                                preScaled?.templates?.get(definition) ?: template,
+                            ),
                             rect = rect,
                         )
                     }
@@ -588,7 +608,11 @@ class LabyrinthEntryFrameProcessor(
                     else characterRecognizer.recognizeRoleRewardChoices(frame)
             } else if (observation.state == LabyrinthEntryPageState.INITIAL_CHARACTER_SELECTION) {
                 battleTeamNanos = measureNanoTime {
-                    openingCharacterSelection = battleTeamRecognizer.recognizeOpening(frame)
+                    openingCharacterSelection = battleTeamRecognizer.recognizeOpening(
+                        frame,
+                        allowInitial1088GeometryRefinement = allowInitial1088GeometryRefinement() &&
+                            labyrinthOpeningRosterOwnsInitialSelection(anchorScores, MATCHED_FEATURE_MIN_SCORE),
+                    )
                 }
                 openingCharacterMatches = openingCharacterSelection?.visibleCharacters.orEmpty()
             }
@@ -847,7 +871,7 @@ class LabyrinthEntryFrameProcessor(
             // candidates instead of widening the ROI (which would rescale the template).
             standard(EntryAnchorId.SHOP_PURCHASE_CONFIRMATION_TITLE, 750, 125, 420, 75),
             standard(EntryAnchorId.SHOP_PURCHASE_CONFIRMATION_TITLE, 750, 133, 420, 75),
-            standard(EntryAnchorId.SHOP_PURCHASE_COMPLETE_TITLE, 750, 245, 420, 75),
+            standard(EntryAnchorId.SHOP_PURCHASE_COMPLETE_TITLE, 750, 258, 420, 75),
             standard(EntryAnchorId.SHOP_EXIT_CONFIRMATION_TITLE, 750, 240, 420, 75),
             standard(EntryAnchorId.SHOP_EXIT_CONFIRM_BUTTON, 980, 706, 400, 80),
             // Current purchase-confirmation modal renders the same blue "确认" button lower.
@@ -891,7 +915,10 @@ class LabyrinthEntryFrameProcessor(
             standard(EntryAnchorId.SPECIAL_EQUIPMENT_EQUIP_CONFIRM_DISABLED, 1428, 917, 396, 81),
             standard(EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_DIALOG_ANCHOR, 760, 56, 400, 58),
             standard(EntryAnchorId.SPECIAL_EQUIPMENT_AUTO_DIALOG_CONFIRM_BUTTON, 982, 917, 396, 91),
-            standard(EntryAnchorId.SESSION_ERROR_TITLE, 485, 259, 948, 66),
+            // 只框「错误提示」四个字。原先框住整条 948x66 蓝标题（文字仅占 10% 面积），
+            // 与商店「购买完毕」的同款蓝条区分不开：实测该模板在购买完毕弹窗上得 0.729，
+            // 超过 0.55 的会话门槛，每次购买都被判成掉线。裁到文字后同一张图只有 0.179。
+            standard(EntryAnchorId.SESSION_ERROR_TITLE, 859, 272, 200, 44),
             standard(EntryAnchorId.SESSION_RETURN_TITLE, 756, 692, 410, 94),
             standard(EntryAnchorId.SESSION_DATE_CHANGE_TITLE, 790, 258, 340, 70),
             // Current client renders the same date-change title 3 px right/down. Keep both

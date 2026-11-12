@@ -17,4 +17,5 @@ com/landosol/toolbox/labyrinth/LabyrinthRerollService.kt # A | application scope
 com/landosol/toolbox/labyrinth/AndroidLabyrinthCnDatabaseRepository.kt # A | desktop SQLite
 com/landosol/toolbox/permissions/PermissionStatusReader.kt # A | environment page
 com/landosol/toolbox/ui/permissions/PermissionCenterScreen.kt # A | environment page
+com/landosol/toolbox/ui/labyrinth/LabyrinthConfigShareScreen.kt # A | desktop share screen
 com/landosol/toolbox/ui/LandosolToolboxApp.kt # A | desktop navigation
