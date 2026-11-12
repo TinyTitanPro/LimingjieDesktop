@@ -18,3 +18,12 @@ Thumbs.db
 .tools/
 .upstream-import/
 .gradle-user-home/
+# Agent and editor working artifacts
+.screenshots/
+.trae/
+.claude/
+.cursor/
+.codex/
+.cline/
+.aider*
+*.jsonl
