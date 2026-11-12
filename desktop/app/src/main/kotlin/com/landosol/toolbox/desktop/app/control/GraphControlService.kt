@@ -239,15 +239,24 @@ class GraphControlService(
             ControlOps.ACCOUNT_DISMISS -> {
                 graph.accounts.dismissEditor(); graph.accounts.dismissDelete(); graph.accounts.dismissMessage()
             }
-            ControlOps.STRATEGY_SAVE -> graph.labyrinthStrategySettings.save(decode(args.required("value")))
+            ControlOps.STRATEGY_SAVE -> {
+                graph.labyrinthStrategySettings.save(decode(args.required("value")))
+                mirrorStrategy()
+            }
             ControlOps.STRATEGY_ADD -> {
                 val id = graph.labyrinthStrategySettings.add(args.requiredString("name"), args.string("note").orEmpty(),
                     args["value"]?.let { decode<LabyrinthStrategySettings>(it) } ?: LabyrinthStrategySettings())
                 return buildJsonObject { put("id", id) }
             }
-            ControlOps.STRATEGY_EDIT -> graph.labyrinthStrategySettings.edit(args.requiredString("id"), args.long("revision"),
-                args.requiredString("name"), args.string("note").orEmpty(), decode(args.required("value")))
-            ControlOps.STRATEGY_ACTIVATE -> graph.labyrinthStrategySettings.activate(args.requiredString("id"))
+            ControlOps.STRATEGY_EDIT -> {
+                graph.labyrinthStrategySettings.edit(args.requiredString("id"), args.long("revision"),
+                    args.requiredString("name"), args.string("note").orEmpty(), decode(args.required("value")))
+                mirrorStrategy()
+            }
+            ControlOps.STRATEGY_ACTIVATE -> {
+                graph.labyrinthStrategySettings.activate(args.requiredString("id"))
+                mirrorStrategy()
+            }
             ControlOps.STRATEGY_DELETE -> graph.labyrinthStrategySettings.delete(args.requiredString("id"))
             ControlOps.STRATEGY_IMPORT -> {
                 val imported = com.landosol.toolbox.desktop.app.adapters.storage.StrategyShareCodec.decode(args.requiredString("code"))
@@ -355,6 +364,19 @@ class GraphControlService(
                 check(args.requiredString("ticketId") == captchaTicket) { "验证码已失效，请使用当前实例的验证" }
                 check(!graph.labyrinthController.uiState.value.isWorking) { "验证正在提交，请稍候；需要中止时请停止任务" }
                 graph.labyrinthController.cancelCaptcha(); closeCaptcha()
+            }
+            ControlOps.CONFIG_BLOCKED -> return buildJsonObject { put("blocked", graph.configurationTransferBlockedReason() != null) }
+            ControlOps.CONFIG_EXPORT -> return buildJsonObject {
+                put("code", configShareExport(args))
+            }
+            ControlOps.CONFIG_DECODE -> return configShareDecode(args)
+            ControlOps.CONFIG_PREVIEW -> return configSharePreview(args)
+            ControlOps.CONFIG_COMMIT -> {
+                configShareCommit(args); graph.log.add("配置分享码导入完成")
+            }
+            ControlOps.CONFIG_UNDO_CHECK -> return configShareUndoCheck()
+            ControlOps.CONFIG_UNDO -> {
+                configShareUndo(args); graph.log.add("已撤销最近一次配置导入")
             }
             else -> error("不支持的控制操作：$op")
         }
@@ -640,8 +662,159 @@ class GraphControlService(
     private companion object {
         val GLOBAL_EDITS = setOf(ControlOps.ACCOUNT_NEW, ControlOps.ACCOUNT_EDIT, ControlOps.ACCOUNT_SAVE,
             ControlOps.ACCOUNT_DELETE, ControlOps.STRATEGY_SAVE, ControlOps.STRATEGY_ADD, ControlOps.STRATEGY_EDIT,
-            ControlOps.STRATEGY_ACTIVATE, ControlOps.STRATEGY_DELETE, ControlOps.STRATEGY_IMPORT, ControlOps.SETTINGS_PATCH, ControlOps.ADB_CONFIGURE, ControlOps.ADB_DOWNLOAD)
+            ControlOps.STRATEGY_ACTIVATE, ControlOps.STRATEGY_DELETE, ControlOps.STRATEGY_IMPORT, ControlOps.SETTINGS_PATCH,
+            ControlOps.ADB_CONFIGURE, ControlOps.ADB_DOWNLOAD,
+            ControlOps.CONFIG_EXPORT, ControlOps.CONFIG_PREVIEW, ControlOps.CONFIG_COMMIT, ControlOps.CONFIG_UNDO)
         val DATA_ROLE_FORBIDDEN = setOf(ControlOps.START, ControlOps.STOP, ControlOps.PAUSE, ControlOps.PREVIEW,
             ControlOps.DEVICE_CONNECT, ControlOps.DEVICE_DISCONNECT, ControlOps.DEVICE_TEST, ControlOps.CAPTURE_STOP)
+    }
+
+    // Configuration share codes: the plan is decoded and held worker-side so the commit can
+    // re-validate against the live configuration, mirroring the upstream screen's saved == expected check.
+    private var configSharePlan: Pair<String, LabyrinthConfigImportPlan>? = null
+    private var configShareRoleNames: Map<String, String> = emptyMap()
+
+    private suspend fun roleNamesOrEmpty(): Map<String, String> = try {
+        graph.loadLabyrinthRoleRatings().associate { it.id to it.name }
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        emptyMap()
+    }
+
+    private suspend fun <T> configTransfer(action: suspend () -> T): T = graph.withConfigurationTransfer { action() }
+
+    /** Desktop keeps named strategy profiles; the shared snapshot mirrors the active one so share codes match upstream. */
+    private suspend fun mirrorStrategy() {
+        val settings = graph.labyrinthStrategySettings.state.value
+        if (graph.labyrinthConfiguration.state.value.strategy != settings) {
+            withContext(kotlinx.coroutines.Dispatchers.IO) { graph.labyrinthConfiguration.saveStrategy(settings) }
+        }
+    }
+
+    private fun configModules(args: JsonObject): Set<LabyrinthConfigModule> =
+        args.required("modules").jsonArray.map { LabyrinthConfigModule.valueOf(it.jsonPrimitive.content) }.toSet()
+
+    private suspend fun configShareExport(args: JsonObject): String = configTransfer {
+        val modules = configModules(args)
+        check(modules.isNotEmpty()) { "请至少选择一个导出模块" }
+        val source = args["accountId"]?.jsonPrimitive?.longOrNull
+        if (LabyrinthConfigModule.REROLL in modules) {
+            checkNotNull(source) { "刷开局设置需要目标账号" }
+            check(graph.database.accountDao().getSelected()?.id == source &&
+                source == graph.labyrinthController.configurationAccountId &&
+                graph.labyrinthController.uiState.value.settingsReady) { "当前账号正在切换，请稍后重试" }
+        }
+        val values = graph.labyrinthConfiguration.state.value
+        withContext(kotlinx.coroutines.Dispatchers.Default) {
+            LabyrinthConfigShareCodec.encode(
+                LabyrinthConfigShareCodec.create(values, modules, source, com.landosol.toolbox.AppVersion.display, System.currentTimeMillis()),
+            )
+        }
+    }
+
+    private suspend fun configShareDecode(args: JsonObject): JsonObject = configTransfer {
+        val input = args.requiredString("input")
+        val configuration = withContext(kotlinx.coroutines.Dispatchers.Default) { LabyrinthConfigShareCodec.decode(input) }
+        val names = roleNamesOrEmpty()
+        val roleWarning = if (names.isEmpty()) "角色目录不可用，暂无法核对角色引用。"
+        else configuration.unknownRoleIds(names.keys).takeIf { it.isNotEmpty() }?.let {
+            "暂缺 ${it.size} 个角色，引用将保留。编号：${it.take(12).joinToString()}"
+        }
+        buildJsonObject {
+            put("modules", model(configuration.modules.map { it.name }))
+            put("appVersion", configuration.appVersion)
+            put("exportedAtMillis", configuration.exportedAtMillis)
+            configuration.personalScores?.let { put("personalScores", it.size) }
+            roleWarning?.let { put("roleWarning", it) }
+        }
+    }
+
+    private suspend fun configSharePreview(args: JsonObject): JsonObject = configTransfer {
+        val input = args.requiredString("input")
+        val modules = configModules(args)
+        check(modules.isNotEmpty()) { "请至少选择一个导入模块" }
+        val targetAccountId = args["targetAccountId"]?.jsonPrimitive?.longOrNull
+        val configuration = withContext(kotlinx.coroutines.Dispatchers.Default) { LabyrinthConfigShareCodec.decode(input) }
+        if (LabyrinthConfigModule.REROLL in modules) {
+            checkNotNull(targetAccountId) { "刷开局设置需要目标账号" }
+            check(graph.database.accountDao().getById(targetAccountId) != null) { "目标账号不存在，请重新选择" }
+        }
+        val names = roleNamesOrEmpty()
+        val plan = LabyrinthConfigImportPlan(configuration, modules, targetAccountId, graph.labyrinthConfiguration.state.value)
+        val planId = java.util.UUID.randomUUID().toString()
+        configSharePlan = planId to plan
+        configShareRoleNames = names
+        buildJsonObject {
+            put("planId", planId)
+            put("changes", model(plan.changeSummary(names)))
+            put("clearsPersonalScores", plan.clearsPersonalScores)
+        }
+    }
+
+    private suspend fun configShareCommit(args: JsonObject) = configTransfer {
+        val planId = args.requiredString("planId")
+        val (_, plan) = checkNotNull(configSharePlan?.takeIf { it.first == planId }) { "预览已失效，请重新预览" }
+        val confirmEmptyScores = args["confirmEmptyScores"]?.jsonPrimitive?.booleanOrNull ?: false
+        check(graph.labyrinthConfiguration.state.value == plan.expected) { "本机配置已变化，请重新预览后确认导入" }
+        val target = plan.targetAccountId
+        if (LabyrinthConfigModule.REROLL in plan.selected) {
+            val committedTarget = checkNotNull(target) { "刷开局设置需要目标账号" }
+            check(graph.database.accountDao().getById(committedTarget) != null) { "目标账号已不存在，请重新选择" }
+            graph.labyrinthController.importedDifficultyError(committedTarget, plan.configuration.reroll!!.difficulty)?.let { error(it) }
+        }
+        kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+            val committed = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                graph.labyrinthConfiguration.importConfiguration(plan.configuration, plan.selected, target, confirmEmptyScores, plan.expected)
+            }
+            if (LabyrinthConfigModule.REROLL in plan.selected) {
+                graph.labyrinthController.onConfigurationImported(checkNotNull(target), committed.rerolls.getValue(checkNotNull(target)))
+            }
+            // Push the imported strategy into the active desktop profile so the editor shows it.
+            if (LabyrinthConfigModule.STRATEGY in plan.selected || LabyrinthConfigModule.PERSONAL_SCORES in plan.selected) {
+                graph.labyrinthStrategySettings.save(committed.strategy)
+            }
+            configSharePlan = null
+        }
+    }
+
+    private suspend fun configShareUndoCheck(): JsonObject = configTransfer {
+        val previous = graph.labyrinthConfiguration.state.value
+        val undo = previous.undoImport
+        if (undo == null) return@configTransfer buildJsonObject { put("available", false) }
+        val names = roleNamesOrEmpty()
+        val restored = LabyrinthConfigShareCodec.create(
+            LabyrinthConfigurationValues(undo.strategy, undo.rerolls), undo.modules, undo.accountId, com.landosol.toolbox.AppVersion.display, 0,
+        )
+        val summary = LabyrinthConfigImportPlan(restored, undo.modules, undo.accountId, previous).changeSummary(names)
+        buildJsonObject {
+            put("available", true)
+            put("changes", model(summary))
+            put("clearsPersonalScores", LabyrinthConfigModule.PERSONAL_SCORES in undo.modules && undo.strategy.personalRoleScores.isEmpty())
+            undo.accountId?.let { id ->
+                put("targetLabel", graph.database.accountDao().getById(id)?.let { "${it.alias} · ${it.serverId}" } ?: "账号已不存在")
+            }
+        }
+    }
+
+    private suspend fun configShareUndo(args: JsonObject) = configTransfer {
+        val confirmEmptyScores = args["confirmEmptyScores"]?.jsonPrimitive?.booleanOrNull ?: false
+        val previous = graph.labyrinthConfiguration.state.value
+        val undo = checkNotNull(previous.undoImport) { "没有可撤销的导入，或导入后已手动保存其他配置" }
+        if (LabyrinthConfigModule.PERSONAL_SCORES in undo.modules && undo.strategy.personalRoleScores.isEmpty()) {
+            check(confirmEmptyScores) { "需要确认清除自定义评分" }
+        }
+        kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+            val restored = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                graph.labyrinthConfiguration.undoImport(previous)
+            }
+            val undoAccountId = undo.accountId
+            if (LabyrinthConfigModule.REROLL in undo.modules && undoAccountId != null) {
+                graph.labyrinthController.onConfigurationImported(undoAccountId, restored.rerolls[undoAccountId] ?: LabyrinthRerollSettings())
+            }
+            if (LabyrinthConfigModule.STRATEGY in undo.modules || LabyrinthConfigModule.PERSONAL_SCORES in undo.modules) {
+                graph.labyrinthStrategySettings.save(restored.strategy)
+            }
+        }
     }
 }

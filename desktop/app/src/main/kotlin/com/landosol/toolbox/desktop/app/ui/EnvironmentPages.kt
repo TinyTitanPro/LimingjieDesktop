@@ -166,6 +166,8 @@ import javax.swing.filechooser.FileNameExtensionFilter
     var networkResult by remember { mutableStateOf<String?>(null) }
     var updateResult by remember { mutableStateOf<String?>(null) }
     var group by remember { mutableStateOf("外观与通知") }
+    var configShare by remember { mutableStateOf(false) }
+    if (configShare) ConfigurationShareDialog(graph) { configShare = false }
     PageBody("设置", "查看任务前置条件和桌面偏好，每项检查都在此处反馈。") {
         Row(horizontalArrangement=Arrangement.spacedBy(16.dp)) {
             Column(Modifier.width(145.dp),verticalArrangement=Arrangement.spacedBy(6.dp)) {
@@ -237,6 +239,10 @@ import javax.swing.filechooser.FileNameExtensionFilter
             }
             Message(updateResult)
             LaunchedEffect(updateResult){if(updateResult!=null)graph.ux.refreshDatabase()}
+            HorizontalDivider()
+            Text("配置导入与导出", style = MaterialTheme.typography.titleSmall)
+            Text("通过分享码分享全局策略、个人评分和刷开局设置；导入导出与任务互斥。", color = Muted, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(shape=MaterialTheme.shapes.small,onClick = { configShare = true }, enabled = !actions.working) { Text("管理配置分享码") }
         }
         if(group=="关于") Panel("关于") {
             Text("黎明界助手 ${AppVersion.name} · Windows 社区移植")

@@ -63,4 +63,12 @@ object ControlOps {
     const val OPEN_LOGS="files.openLogs"
     const val OPEN_CRASH="files.openCrash" // name:String only; never an arbitrary path
     const val CAPTCHA_CANCEL="captcha.cancel" // ticketId:String
+    // Labyrinth configuration share codes; all heavy work (decode, plan, commit) runs in the worker that owns the store.
+    const val CONFIG_BLOCKED="config.blocked" // reply blocked:Boolean
+    const val CONFIG_EXPORT="config.export" // modules:[LabyrinthConfigModule.name],accountId:Long?; reply code:String
+    const val CONFIG_DECODE="config.decode" // input:String; reply modules:[name],appVersion:String,exportedAtMillis:Long,personalScores:Int?,roleWarning:String?
+    const val CONFIG_PREVIEW="config.preview" // input:String,modules:[name],targetAccountId:Long?; reply planId:String,changes:[String],clearsPersonalScores:Boolean
+    const val CONFIG_COMMIT="config.commit" // planId:String,confirmEmptyScores:Boolean
+    const val CONFIG_UNDO_CHECK="config.undo.check" // reply available:Boolean,changes:[String],clearsPersonalScores:Boolean,targetLabel:String?
+    const val CONFIG_UNDO="config.undo" // confirmEmptyScores:Boolean
 }
