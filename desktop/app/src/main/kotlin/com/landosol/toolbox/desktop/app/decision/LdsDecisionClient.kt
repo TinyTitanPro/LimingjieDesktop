@@ -16,7 +16,9 @@ class LdsDecisionClient(endpoint: String) {
     @Volatile private var address = resolveAddress(base)
     private val http = OkHttpClient.Builder().proxy(Proxy.NO_PROXY)
         .connectTimeout(CONNECT_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
-        .readTimeout(15, TimeUnit.SECONDS).writeTimeout(15, TimeUnit.SECONDS).build()
+        .readTimeout(15, TimeUnit.SECONDS).writeTimeout(15, TimeUnit.SECONDS)
+        // 执行层在识别线程内同步咨询，服务挂起也必须尽快降级回内置逻辑。
+        .callTimeout(DECISION_CALL_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS).build()
 
     /** 设置页热更新端点；后续请求立即生效。 */
     fun updateEndpoint(endpoint: String) {
@@ -48,5 +50,8 @@ class LdsDecisionClient(endpoint: String) {
     private fun resolveAddress(base: String): InetSocketAddress =
         URI(base).run { InetSocketAddress(host, if (port > 0) port else if (scheme == "https") 443 else 80) }
 
-    private companion object { const val CONNECT_TIMEOUT_MILLIS = 2_000L }
+    private companion object {
+        const val CONNECT_TIMEOUT_MILLIS = 2_000L
+        const val DECISION_CALL_TIMEOUT_MILLIS = 4_000L
+    }
 }

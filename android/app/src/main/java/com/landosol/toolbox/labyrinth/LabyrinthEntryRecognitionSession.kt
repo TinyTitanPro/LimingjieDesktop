@@ -4901,6 +4901,37 @@ class LabyrinthEntryRecognitionSession(
     }
 
     /**
+     * 逐格寻路顾问：把当前格、本区完整地图与已踏破格交给外部决策服务，只返回下一格；
+     * 该格必须是当前格的协议后继，否则节点会话会忽略它并沿用预计算路线。
+     */
+    private fun externalNodeRouteAdvisor():
+        ((Long, List<com.landosol.toolbox.protocol.labyrinth.LabyrinthMapNode>, Set<Long>) -> Long?)? {
+        val gateway = decisionGateway ?: return null
+        return { currentBlockId, areaNodes, visited ->
+            if (areaNodes.isEmpty()) {
+                null
+            } else runCatching {
+                gateway.nodeRoute(
+                    LabyrinthDecisionGateway.NodeRouteRequest(
+                        currentBlockId = currentBlockId,
+                        blocks = areaNodes.map { node ->
+                            LabyrinthDecisionGateway.MapBlock(
+                                blockId = node.blockId,
+                                region = node.area,
+                                column = node.column,
+                                blockType = node.blockType,
+                                nextBlockIds = node.nextBlockIds,
+                                bossUnitIds = emptyList(),
+                                cleared = node.blockId in visited,
+                            )
+                        },
+                    ),
+                )?.nextBlockId
+            }.getOrNull()
+        }
+    }
+
+    /**
      * 最终首领战前的外部分数判断。已踏破统计取自选定路线的已走前缀，区域完成度按“非当前区域”
      * 判定；返回 true 表示已按外部结论撤退重开，调用方必须停止本帧继续点击。
      */
@@ -8821,7 +8852,7 @@ class LabyrinthEntryRecognitionSession(
                 val templates = runCatching(loadTemplates).getOrElse { error ->
                     return@run "加载节点模板失败：${error.message ?: "未知错误"}"
                 }
-                val session = nodeSessionFactory()
+                val session = nodeSessionFactory().also { it.setRouteAdvisor(externalNodeRouteAdvisor()) }
                 val routeNodes = route.toLabyrinthRoute().nodes
                 val initializationFailure = runCatching {
                     session.initialize(

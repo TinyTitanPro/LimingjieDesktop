@@ -44,6 +44,89 @@ class LabyrinthNodeSession(
     private var lastClassifications: List<NodeClassification> = emptyList()
 
     /**
+     * 逐格路线顾问：给定当前格、本区完整地图与已踏破格，返回下一格；返回 null 表示沿用
+     * 预计算路线。仅在该格尚未咨询过时调用一次，避免每帧阻塞。
+     */
+    private var routeAdvisor: ((currentBlockId: Long, areaNodes: List<LabyrinthMapNode>, visited: Set<Long>) -> Long?)? = null
+    private var advisedForNodeId: Long? = null
+
+    /** 外部决策接入点；null 恢复为完全按预计算路线行进。 */
+    fun setRouteAdvisor(
+        advisor: ((currentBlockId: Long, areaNodes: List<LabyrinthMapNode>, visited: Set<Long>) -> Long?)?,
+    ) {
+        routeAdvisor = advisor
+        advisedForNodeId = null
+    }
+
+    /**
+     * 询问路线顾问并就地重算剩余路线。
+     *
+     * 只接受当前格真实存在的后继；偏离原路线时，用地图 nextBlockIds 的 BFS 结果替换剩余
+     * 路线（仍以本区终点/首领为终点），从而让匹配、目标绑定与区域推进都继续有效。
+     */
+    private fun applyRouteAdvisor() {
+        val advisor = routeAdvisor ?: return
+        val currentId = state.currentNodeId ?: return
+        if (advisedForNodeId == currentId) return
+        advisedForNodeId = currentId
+        val current = allMapNodes.firstOrNull { it.blockId == currentId } ?: return
+        if (current.area != state.currentArea) return
+        val areaNodes = allMapNodes.filter { it.area == current.area }
+        val choice = advisor(currentId, areaNodes, state.visitedNodes.toSet()) ?: return
+        if (choice == currentId || choice !in current.nextBlockIds) return
+        val target = areaNodes.firstOrNull { it.blockId == choice } ?: return
+        if (target.area != current.area) return
+        val currentIndex = routeNodes.indexOfFirst { it.blockId == currentId }
+        if (currentIndex >= 0 && routeNodes.getOrNull(currentIndex + 1)?.blockId == choice) return
+        val tail = searchPathToAreaEnd(areaNodes, target.blockId) ?: return
+        val prefix = if (currentIndex >= 0) {
+            routeNodes.take(currentIndex + 1)
+        } else {
+            routeNodes.takeWhile { it.area < current.area } + current
+        }
+        routeNodes = (prefix + tail).distinctBy(LabyrinthMapNode::blockId)
+        debugLogger.log("route-advisor current=$currentId choice=$choice path=${tail.joinToString { it.blockId.toString() }}")
+    }
+
+    /** 从 [fromId] 沿 nextBlockIds 找一条到本区终点/首领的路径；优先保持协议给出的顺序。 */
+    private fun searchPathToAreaEnd(areaNodes: List<LabyrinthMapNode>, fromId: Long): List<LabyrinthMapNode>? {
+        val byId = areaNodes.associateBy(LabyrinthMapNode::blockId)
+        val start = byId[fromId] ?: return null
+        fun isEnd(node: LabyrinthMapNode): Boolean =
+            node.isAreaLastPoint || node.blockType == LabyrinthNodeTypes.BOSS ||
+                node.nextBlockIds.none { byId.containsKey(it) }
+        if (isEnd(start)) return listOf(start)
+        val previous = linkedMapOf<Long, Long>()
+        val queue = ArrayDeque<Long>().apply { add(fromId) }
+        val seen = mutableSetOf(fromId)
+        var goal: Long? = null
+        while (queue.isNotEmpty()) {
+            val id = queue.removeFirst()
+            val node = byId[id] ?: continue
+            if (id != fromId && isEnd(node)) {
+                goal = id
+                break
+            }
+            node.nextBlockIds.forEach { next ->
+                if (byId.containsKey(next) && seen.add(next)) {
+                    previous[next] = id
+                    queue.add(next)
+                }
+            }
+        }
+        val end = goal ?: return null
+        val path = mutableListOf<LabyrinthMapNode>()
+        var cursor: Long? = end
+        while (cursor != null && cursor != fromId) {
+            byId[cursor]?.let(path::add)
+            cursor = previous[cursor]
+        }
+        if (cursor != fromId) return null
+        path.add(start)
+        return path.asReversed()
+    }
+
+    /**
      * 初始化会话
      */
     fun initialize(
@@ -105,6 +188,7 @@ class LabyrinthNodeSession(
         }
         lastMatchResult = null
         lastClassifications = emptyList()
+        advisedForNodeId = null
     }
 
     /**
@@ -114,6 +198,7 @@ class LabyrinthNodeSession(
         if (state.isComplete) {
             return NodeAction.Complete
         }
+        applyRouteAdvisor()
 
         val matchResult = matcher.match(
             frame = frame,
@@ -139,6 +224,7 @@ class LabyrinthNodeSession(
         if (state.isComplete) {
             return NodeAction.Complete
         }
+        applyRouteAdvisor()
 
         lastClassifications = classifications
         val matchResult = matcher.matchClassified(

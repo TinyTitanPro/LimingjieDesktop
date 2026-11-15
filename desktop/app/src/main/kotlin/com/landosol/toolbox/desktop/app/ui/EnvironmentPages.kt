@@ -270,7 +270,7 @@ import javax.swing.filechooser.FileNameExtensionFilter
                     Text(label, fontSize = 12.5.sp)
                 }
             }
-            Text("当前版本已接入：事件选择、遗物三选一、印记三选一、角色三选一、开局筛选、开局选人、编队、最终首领前分数判断。寻路与清票仍走内置策略。", color = Muted, fontSize = 12.5.sp)
+            Text("当前版本已接入：事件选择、遗物三选一、印记三选一、角色三选一、开局筛选、开局选人、编队、逐格寻路、最终首领前分数判断。清票仍走内置策略。", color = Muted, fontSize = 12.5.sp)
         }
         if(group=="关于") Panel("关于") {
             Text("黎明界助手 ${AppVersion.name} · Windows 社区移植")
