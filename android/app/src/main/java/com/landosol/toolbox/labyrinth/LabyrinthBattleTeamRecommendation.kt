@@ -1,5 +1,7 @@
 package com.landosol.toolbox.labyrinth
 
+import com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway
+
 data class LabyrinthRecommendedTeamMember(
     val characterId: String,
     val displayName: String,
@@ -87,6 +89,8 @@ sealed interface LabyrinthBattleTeamRecommendationResult {
 class LabyrinthBattleTeamRecommendationPlanner(
     private val profiles: Map<String, LabyrinthRoleProfile>,
     private val teamPlanSearcher: LabyrinthTeamPlanSearcher,
+    /** 外部决策网关；null、缺少 quest id 或返回计划不可用时回退内置搜索。 */
+    private val gateway: LabyrinthDecisionGateway? = null,
 ) {
     fun initialRecommendation(
         acquiredCharacterIds: Collection<String>,
@@ -97,6 +101,10 @@ class LabyrinthBattleTeamRecommendationPlanner(
          * for this slot may lead without a qualified vanguard rather than leave the slot empty.
          */
         allowSupplementLead: Boolean = false,
+        /** 本场战斗 quest id；外部编队决策必需，缺失时不接管。 */
+        questId: Long? = null,
+        /** Boss 多队槽位（1..3）；外部多队计划按该槽位取用。 */
+        teamIndex: Int = 1,
     ): LabyrinthBattleTeamRecommendationResult {
         require(requestedBossTeamCount in 1..3)
         val canonicalIds = acquiredCharacterIds.map(::canonicalLabyrinthRoleId).distinct()
@@ -109,6 +117,8 @@ class LabyrinthBattleTeamRecommendationPlanner(
         if (resolved.isEmpty()) {
             return LabyrinthBattleTeamRecommendationResult.Unavailable("没有已获得的可用角色")
         }
+        externalRecommendation(knownProfiles, context, requestedBossTeamCount, questId, teamIndex)
+            ?.let { return LabyrinthBattleTeamRecommendationResult.Ready(it) }
         // A pool with nobody fit to lead is not a reason to skip the fight: the run still has to
         // play it. Fall back to the vanguard-less composition the Boss follow-up slots already use
         // rather than blocking 编组 (2026-09-19, by request). The planner still never promotes a
@@ -185,6 +195,57 @@ class LabyrinthBattleTeamRecommendationPlanner(
                 plannedBossTeamCount = plan.teams.size.coerceIn(1, 3),
                 safeBossTeamCount = plan.safeTeamCount.coerceIn(0, plan.teams.size.coerceIn(1, 3)),
             ),
+        )
+    }
+
+    /**
+     * 外部编队接管：按 quest id 与槽位向网关索取三队计划，取本槽位队伍并解析回本目录角色。
+     * 任一环节不可靠（缺 quest id、返回撤退、角色不在资料、一号位不满足内置生存线）都返回
+     * null 交回内置搜索，不绕过既有安全校验。
+     */
+    private fun externalRecommendation(
+        knownProfiles: Map<String, LabyrinthRoleProfile>,
+        context: LabyrinthRoleDecisionContext,
+        requestedBossTeamCount: Int,
+        questId: Long?,
+        teamIndex: Int,
+    ): LabyrinthBattleTeamRecommendation? {
+        val gateway = gateway ?: return null
+        val questId = questId?.takeIf { it > 0 } ?: return null
+        val outcome = gateway.teamPlan(
+            LabyrinthDecisionGateway.TeamPlanRequest(
+                questId = questId,
+                partyCount = requestedBossTeamCount,
+                pastAttempts = emptyList(),
+                unitNpcFlags = emptyList(),
+            ),
+        ) as? LabyrinthDecisionGateway.TeamPlanOutcome.Parties ?: return null
+        val party = outcome.parties.getOrNull(teamIndex - 1)?.takeIf { it.isNotEmpty() } ?: return null
+        // 游戏完整单位 ID 反解为基础角色 ID（107501 -> 1075）。
+        val members = party
+            .mapNotNull { unitId -> knownProfiles[(unitId / 100).toString()] }
+            .distinctBy(LabyrinthRoleProfile::characterId)
+        if (members.isEmpty() || members.size > TEAM_SIZE) return null
+        val vanguard = members.first()
+        if (!vanguard.isEligibleBattleVanguard(context)) return null
+        val damageTypes = members.mapNotNull(LabyrinthRoleProfile::damageType).distinct()
+        val damageType = when {
+            damageTypes.isEmpty() -> LabyrinthTeamDamageType.NONE
+            damageTypes.all { it == LabyrinthRoleDamageType.PHYSICAL } -> LabyrinthTeamDamageType.PHYSICAL
+            damageTypes.all { it == LabyrinthRoleDamageType.MAGIC } -> LabyrinthTeamDamageType.MAGIC
+            else -> LabyrinthTeamDamageType.MIXED
+        }
+        return LabyrinthBattleTeamRecommendation(
+            members = members.map { LabyrinthRecommendedTeamMember(it.characterId, it.displayName) },
+            damageType = damageType,
+            score = 0.0,
+            vanguard = LabyrinthRecommendedTeamMember(vanguard.characterId, vanguard.displayName),
+            survivalAnchor = null,
+            reasons = listOf("外部决策服务编队（第${teamIndex}队）"),
+            defenseMarkStacks = context.defenseMarkStacks,
+            targetCount = context.targetCount,
+            plannedBossTeamCount = requestedBossTeamCount,
+            safeBossTeamCount = requestedBossTeamCount,
         )
     }
 

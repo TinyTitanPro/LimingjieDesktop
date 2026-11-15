@@ -108,6 +108,8 @@ internal fun labyrinthBalancedBattleRecommendation(
     eligibleIds: List<String>, context: LabyrinthRoleDecisionContext,
     failedSignatures: Set<String>, lastFailedSignature: String?, retryNumber: Int,
     requestedBossTeamCount: Int, allowSupplementLead: Boolean, teamIndex: Int,
+    /** 本场战斗 quest id；外部编队决策必需，缺失时回退内置。 */
+    questId: Long? = null,
 ): LabyrinthBalancedBattlePlanningOutput {
     if (planner == null) return LabyrinthBalancedBattlePlanningOutput(
         LabyrinthBattleTeamRecommendationResult.Unavailable(unavailableReason ?: "角色决策资料未加载"), false)
@@ -118,7 +120,8 @@ internal fun labyrinthBalancedBattleRecommendation(
             lastFailedTeamSignature = lastFailedSignature, requestedBossTeamCount = requestedBossTeamCount,
             allowSupplementLead = allowSupplementLead,
         ) else planner.initialRecommendation(acquiredCharacterIds = eligibleIds, context = context,
-            requestedBossTeamCount = requestedBossTeamCount, allowSupplementLead = allowSupplementLead)
+            requestedBossTeamCount = requestedBossTeamCount, allowSupplementLead = allowSupplementLead,
+            questId = questId, teamIndex = teamIndex)
         LabyrinthBalancedBattlePlanningOutput(result, true)
     } catch (failure: Throwable) {
         // Runtime cancellation is not an unavailable recommendation or an automatic stop.

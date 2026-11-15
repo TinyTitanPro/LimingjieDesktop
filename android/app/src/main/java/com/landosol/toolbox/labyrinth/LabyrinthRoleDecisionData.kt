@@ -105,6 +105,7 @@ object LabyrinthRoleDecisionDataParser {
             battleTeamRecommendationPlanner = LabyrinthBattleTeamRecommendationPlanner(
                 profiles = profiles,
                 teamPlanSearcher = teamPlanSearcher,
+                gateway = gateway,
             ),
             battleTeamSelectionPlanner = LabyrinthBattleTeamSelectionPlanner(profiles),
             decisionGateway = gateway,

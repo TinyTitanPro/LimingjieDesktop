@@ -1687,6 +1687,8 @@ class LabyrinthEntryRecognitionSession(
     private var nodeInitFailedReason: String? = null
     @Volatile
     private var finalBossLocalizationStartedAt = Long.MIN_VALUE
+    /** 已经做过外部分数判断的最终首领格；同一格只问一次，避免每帧阻塞识别线程。 */
+    private var externalScoreCheckedBlockId: Long? = null
     @Volatile
     private var entryPhaseComplete = false
     @Volatile
@@ -4541,7 +4543,10 @@ class LabyrinthEntryRecognitionSession(
         val computeRecommendation = {
             labyrinthBalancedBattleRecommendation(planner, unavailableReason, eligibleCharacterIds,
                 decisionContext, failedSignatures, lastFailedSignature, retryNumber,
-                requestedBossTeamCount, allowSupplementLead, teamIndex)
+                requestedBossTeamCount, allowSupplementLead, teamIndex,
+                questId = validatedRoute?.let { route ->
+                    route.nodes.firstOrNull { it.blockId == route.currentBlockId }?.questId?.toLong()
+                })
         }
         val output = if (balancedMode) {
             val key = listOf(sessionId, roleDecisionGeneration.get(), balancedSceneEpoch, planner,
@@ -4895,9 +4900,59 @@ class LabyrinthEntryRecognitionSession(
         }
     }
 
+    /**
+     * 最终首领战前的外部分数判断。已踏破统计取自选定路线的已走前缀，区域完成度按“非当前区域”
+     * 判定；返回 true 表示已按外部结论撤退重开，调用方必须停止本帧继续点击。
+     */
+    private fun consultExternalScoreCheck(
+        sessionId: AutomationSessionId,
+        boss: com.landosol.toolbox.protocol.labyrinth.LabyrinthMapNode,
+    ): Boolean {
+        val gateway = decisionGateway ?: return false
+        val route = validatedRoute ?: return false
+        val nodes = route.nodes
+        val progress = _state.value.routeProgress
+        val visitedCount = progress?.visitedCount ?: 0
+        val currentIndex = nodes.indexOfFirst { it.blockId == route.currentBlockId }
+        val visited = when {
+            visitedCount in 1..nodes.size -> nodes.take(visitedCount)
+            currentIndex >= 0 -> nodes.take(currentIndex + 1)
+            else -> nodes
+        }
+        val currentArea = progress?.currentArea ?: boss.area
+        val areas = visited.groupBy { it.area }
+        val outcome = gateway.scoreCheck(
+            LabyrinthDecisionGateway.ScoreCheckRequest(
+                blockId = boss.blockId.toLong(),
+                guildId = route.guildId.toLong(),
+                questId = (boss.questId ?: 0).toLong(),
+                unitCount = _state.value.joinedCharacters.size,
+                relicCount = _state.value.observedRelics.size,
+                normalClearCount = visited.count {
+                    it.blockType == com.landosol.toolbox.labyrinth.node.LabyrinthNodeTypes.NORMAL_BATTLE
+                },
+                exClearCount = visited.count {
+                    it.blockType == com.landosol.toolbox.labyrinth.node.LabyrinthNodeTypes.EX_BATTLE
+                },
+                bossClearCount = visited.count {
+                    it.blockType == com.landosol.toolbox.labyrinth.node.LabyrinthNodeTypes.BOSS
+                },
+                areas = areas.entries.sortedBy { it.key }.map { (area, list) ->
+                    LabyrinthDecisionGateway.ScoreCheckRequest.AreaProgress(
+                        region = area,
+                        blockCount = list.size,
+                        cleared = area < currentArea,
+                    )
+                },
+            ),
+        )
+        if (outcome !is LabyrinthDecisionGateway.ScoreCheckOutcome.RetryRun) return false
+        finishFromPlannerAndRequestReroll(sessionId, "外部决策判定本局分数不足，撤退重开")
+        return true
+    }
+
     private fun nodeExecutionConfigured(): Boolean =
         routeLoader != null && nodeTemplateLoader != null
-
     private fun shouldHandOffToRouteExecution(state: LabyrinthEntryPageState): Boolean = state in setOf(
         LabyrinthEntryPageState.NODE_SELECTION,
         LabyrinthEntryPageState.LINK_CHOICE,
@@ -8619,6 +8674,10 @@ class LabyrinthEntryRecognitionSession(
                 return
             }
             finalBossLocalizationStartedAt = Long.MIN_VALUE
+            if (externalScoreCheckedBlockId != directFinalBoss.blockId) {
+                externalScoreCheckedBlockId = directFinalBoss.blockId
+                if (consultExternalScoreCheck(sessionId, directFinalBoss)) return
+            }
             action = NodeAction.ClickNode(
                 blockId = directFinalBoss.blockId,
                 blockType = directFinalBoss.blockType,
