@@ -16,6 +16,7 @@ import com.landosol.toolbox.AppVersion
 import com.landosol.toolbox.automation.GameClientResolution
 import com.landosol.toolbox.desktop.app.control.*
 import com.landosol.toolbox.desktop.app.adapters.device.inProgress
+import com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig
 import com.landosol.toolbox.desktop.device.*
 import com.landosol.toolbox.desktop.ocr.OcrEngineStatus
 import com.landosol.toolbox.desktop.platform.*
@@ -169,7 +170,7 @@ import javax.swing.filechooser.FileNameExtensionFilter
     PageBody("设置", "查看任务前置条件和桌面偏好，每项检查都在此处反馈。") {
         Row(horizontalArrangement=Arrangement.spacedBy(16.dp)) {
             Column(Modifier.width(145.dp),verticalArrangement=Arrangement.spacedBy(6.dp)) {
-                listOf("外观与通知","运行环境","网络与窗口","数据库与本地数据","关于").forEach { label ->
+                listOf("外观与通知","运行环境","网络与窗口","数据库与本地数据","决策服务","关于").forEach { label ->
                     TextButton(onClick={group=label}) { Text(label,color=if(group==label)Accent else Muted) }
                 }
             }
@@ -237,6 +238,39 @@ import javax.swing.filechooser.FileNameExtensionFilter
             }
             Message(updateResult)
             LaunchedEffect(updateResult){if(updateResult!=null)graph.ux.refreshDatabase()}
+        }
+        if(group=="决策服务") Panel("决策服务") {
+            var lds by remember { mutableStateOf(LdsDecisionConfig()) }
+            var ldsPing by remember { mutableStateOf<String?>(null) }
+            LaunchedEffect(graph) {
+                lds = try { LdsDecisionConfig.decode(graph.request(ControlOps.LDS_CONFIG_LOAD)["config"]?.jsonObject) }
+                catch (cancelled:kotlinx.coroutines.CancellationException) { throw cancelled }
+                catch (failure:Exception) { ldsPing = failure.message ?: "读取决策服务配置失败"; LdsDecisionConfig() }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(lds.enabled, { checked -> lds = lds.copy(enabled = checked) })
+                Text("启用决策服务（本机黎明界决策系统，默认 127.0.0.1:8081）", fontSize = 12.5.sp)
+            }
+            Text("未启用或服务不可用时，全部决策回退内置策略；保存后即时生效，无需重启。", color = Muted, fontSize = 12.5.sp)
+            OutlinedTextField(lds.endpoint, { lds = lds.copy(endpoint = it.trim()) }, label = { Text("服务地址") }, singleLine = true, modifier = Modifier.fillMaxWidth(), enabled = !actions.working)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(shape = MaterialTheme.shapes.small, onClick = {
+                    actions.run {
+                        graph.request(ControlOps.LDS_CONFIG_SAVE, buildJsonObject {
+                            put("config", Json.encodeToJsonElement(LdsDecisionConfig.serializer(), lds))
+                        })
+                        ldsPing = graph.request(ControlOps.LDS_PING, buildJsonObject { put("endpoint", lds.endpoint) })["message"]?.jsonPrimitive?.content
+                    }
+                }, enabled = !actions.working) { Text("保存并测试连接") }
+            }
+            Message(ldsPing)
+            lds.toggles.toggleKeys.forEach { (key, label) ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(lds.toggles.toggleValue(key), { checked -> lds = lds.copy(toggles = lds.toggles.withToggle(key, checked)) })
+                    Text(label, fontSize = 12.5.sp)
+                }
+            }
+            Text("当前版本已接入：事件选择、遗物三选一、角色三选一、开局筛选；其余类别在执行层补齐状态供给后自动生效。", color = Muted, fontSize = 12.5.sp)
         }
         if(group=="关于") Panel("关于") {
             Text("黎明界助手 ${AppVersion.name} · Windows 社区移植")

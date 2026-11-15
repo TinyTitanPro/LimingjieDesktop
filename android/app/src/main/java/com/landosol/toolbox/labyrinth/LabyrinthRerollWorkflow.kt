@@ -4,6 +4,7 @@ import androidx.room.withTransaction
 import com.landosol.toolbox.data.local.AppDatabase
 import com.landosol.toolbox.data.local.LabyrinthRerollCheckpointEntity
 import com.landosol.toolbox.data.local.LabyrinthRouteEntity
+import com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway
 import com.landosol.toolbox.protocol.labyrinth.LabyrinthApi
 import com.landosol.toolbox.protocol.labyrinth.LabyrinthEnterRequest
 import com.landosol.toolbox.protocol.labyrinth.LabyrinthFailureKind
@@ -114,6 +115,18 @@ fun LabyrinthNodeJson.toLabyrinthMapNode(): LabyrinthMapNode = LabyrinthMapNode(
     nextBlockIds = nextBlockIds,
     isAreaLastPoint = isAreaLastPoint,
 )
+
+/** 开局筛选的网关图块；协议层开局没有已踏破信息和首领名单，按协议允许的缺省发送。 */
+private fun LabyrinthMapNode.toGatewayBlock(): LabyrinthDecisionGateway.MapBlock =
+    LabyrinthDecisionGateway.MapBlock(
+        blockId = blockId,
+        region = area,
+        column = column,
+        blockType = blockType,
+        nextBlockIds = nextBlockIds,
+        bossUnitIds = emptyList(),
+        cleared = false,
+    )
 
 interface LabyrinthRouteStore {
     suspend fun save(
@@ -483,6 +496,8 @@ class LabyrinthRerollWorkflow(
     private val pause: suspend (Long) -> Unit = { delay(it) },
     private val checkpointStore: LabyrinthRerollCheckpointStore? = null,
     private val clock: () -> Long = System::currentTimeMillis,
+    /** 外部决策网关；null 时开局接受/重试/停止全部由内置路线条件判定。 */
+    private val gateway: LabyrinthDecisionGateway? = null,
 ) {
     private val existingRouteResolver = ExistingLabyrinthRouteResolver(api, matcher)
 
@@ -709,6 +724,59 @@ class LabyrinthRerollWorkflow(
                 verdict = LabyrinthRouteVerdict.PENDING_VERIFICATION,
                 message = "已取得地图，正在判断路线",
             )
+            // 外部决策先于内置路线条件：Accept 放行给本地匹配（执行层仍需要可走的路线文档），
+            // Retry/Stop 由网关的筛选配置决定；无网关或上下文不可得时保持内置判定。
+            when (val external = entered.map.takeIf { it.isNotEmpty() }?.let { map ->
+                gateway?.openingFilter(LabyrinthDecisionGateway.OpeningFilterRequest(
+                    attempt = attempt,
+                    blocks = map.map(LabyrinthMapNode::toGatewayBlock),
+                ))
+            }) {
+                is LabyrinthDecisionGateway.OpeningFilterOutcome.Retry -> {
+                    val message = "外部决策要求重试开局" +
+                        (external.rejectedRegion?.let { "（首个不合格区域 $it）" } ?: "")
+                    saveCheckpoint(
+                        config = config,
+                        attempt = attempt,
+                        enterId = entered.enterId,
+                        verdict = LabyrinthRouteVerdict.NOT_TARGET,
+                        message = message,
+                    )
+                    val retirementFailure = retireUntilGone(
+                        config = config,
+                        attempt = attempt,
+                        expectedEnterId = entered.enterId,
+                        retireStage = "外部决策要求重试，撤退",
+                        confirmationContext = "确认撤退后的服务端状态",
+                        onProgress = onProgress,
+                    )
+                    if (retirementFailure != null) return retirementFailure
+                    checkpointStore?.clear(config.accountId)
+                    paceAttempts(config, attempt, onProgress)
+                    continue
+                }
+                LabyrinthDecisionGateway.OpeningFilterOutcome.Stop -> {
+                    saveCheckpoint(
+                        config = config,
+                        attempt = attempt,
+                        enterId = entered.enterId,
+                        verdict = LabyrinthRouteVerdict.NOT_TARGET,
+                        message = "外部决策判定未达条件且已到上限，停止刷开局",
+                    )
+                    val retirementFailure = retireUntilGone(
+                        config = config,
+                        attempt = attempt,
+                        expectedEnterId = entered.enterId,
+                        retireStage = "外部决策停止刷开局，撤退",
+                        confirmationContext = "确认撤退后的服务端状态",
+                        onProgress = onProgress,
+                    )
+                    if (retirementFailure != null) return retirementFailure
+                    checkpointStore?.clear(config.accountId)
+                    return LabyrinthRerollResult.Exhausted(attempt)
+                }
+                else -> {}
+            }
             val search = matcher.search(
                 enterId = entered.enterId,
                 nodes = entered.map,

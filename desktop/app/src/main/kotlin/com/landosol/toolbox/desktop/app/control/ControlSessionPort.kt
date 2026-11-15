@@ -65,4 +65,7 @@ object ControlOps {
     const val OPEN_LOGS="files.openLogs"
     const val OPEN_CRASH="files.openCrash" // name:String only; never an arbitrary path
     const val CAPTCHA_CANCEL="captcha.cancel" // ticketId:String
+    const val LDS_CONFIG_LOAD="lds.config.load" // reply config:LdsDecisionConfig
+    const val LDS_CONFIG_SAVE="lds.config.save" // config:LdsDecisionConfig
+    const val LDS_PING="lds.ping" // endpoint:String; reply message:String
 }

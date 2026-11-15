@@ -1,6 +1,7 @@
 package com.landosol.toolbox.labyrinth
 
 import com.landosol.toolbox.labyrinth.concurrent.LabyrinthFourThreadRuntime
+import com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway
 import com.landosol.toolbox.labyrinth.vision.LabyrinthFastFrameObservation
 import com.landosol.toolbox.automation.capture.RefCountedFrameLease
 import kotlinx.coroutines.withContext
@@ -1138,6 +1139,7 @@ class LabyrinthEntryRecognitionSession(
     private var roleRewardChoicePlanner: LabyrinthRoleRewardChoicePlanner? = null,
     private val roleRewardChoiceUnavailableReason: String? = null,
     private var eventChoicePlanner: LabyrinthEventChoicePlanner? = null,
+    private var decisionGateway: LabyrinthDecisionGateway? = null,
     private var battleTeamRecommendationPlanner: LabyrinthBattleTeamRecommendationPlanner? = null,
     private val battleTeamRecommendationUnavailableReason: String? = null,
     private var battleTeamSelectionPlanner: LabyrinthBattleTeamSelectionPlanner? = null,
@@ -1997,6 +1999,7 @@ class LabyrinthEntryRecognitionSession(
                 .orEmpty()
             roleRewardChoicePlanner = snapshot.roleRuntime?.rewardChoicePlanner
             eventChoicePlanner = snapshot.roleRuntime?.eventChoicePlanner
+            decisionGateway = snapshot.roleRuntime?.decisionGateway
             battleTeamRecommendationPlanner = snapshot.roleRuntime?.battleTeamRecommendationPlanner
             battleTeamSelectionPlanner = snapshot.roleRuntime?.battleTeamSelectionPlanner
         }
@@ -6446,6 +6449,7 @@ class LabyrinthEntryRecognitionSession(
                         lockedFocus = relicFocusMark,
                         calibratedStacks = relicMarkStackCalibration,
                         currentArea = _state.value.routeProgress?.currentArea,
+                        gateway = decisionGateway,
                     )?.let { decision ->
                         if (!relicIdentityGate.confirmed(decision.choice)) return@let null
                         val mark = LabyrinthRelicMark.fromLabel(decision.choice.attribute)
@@ -10111,6 +10115,7 @@ class LabyrinthEntryRecognitionSession(
                         calibratedStacks = relicMarkStackCalibration,
                         currentArea = current.routeProgress?.currentArea,
                         lockedFocus = relicFocusMark,
+                        gateway = decisionGateway,
                     )?.takeIf { lockedRelic == null }?.let { decision ->
                         add("当前建议：${decision.choice.displayName ?: "未收录"} · ${decision.reason}")
                     }

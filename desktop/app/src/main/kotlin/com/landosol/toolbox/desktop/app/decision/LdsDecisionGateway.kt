@@ -49,20 +49,72 @@ data class LdsDecisionToggles(
     val scoreCheck: Boolean = true,
     val ticketClear: Boolean = true,
     val teamPlan: Boolean = true,
-)
+) {
+    /** 按设置页开关键名读取；未知键返回 false。 */
+    fun toggleValue(key: String): Boolean = when (key) {
+        "openingFilter" -> openingFilter
+        "openingRoster" -> openingRoster
+        "roleChoice" -> roleChoice
+        "ticketChoice" -> ticketChoice
+        "relicChoice" -> relicChoice
+        "event" -> event
+        "nodeRoute" -> nodeRoute
+        "scoreCheck" -> scoreCheck
+        "ticketClear" -> ticketClear
+        "teamPlan" -> teamPlan
+        else -> false
+    }
+
+    /** 按设置页开关键名翻写单个开关；未知键返回原值。 */
+    fun withToggle(key: String, value: Boolean): LdsDecisionToggles = when (key) {
+        "openingFilter" -> copy(openingFilter = value)
+        "openingRoster" -> copy(openingRoster = value)
+        "roleChoice" -> copy(roleChoice = value)
+        "ticketChoice" -> copy(ticketChoice = value)
+        "relicChoice" -> copy(relicChoice = value)
+        "event" -> copy(event = value)
+        "nodeRoute" -> copy(nodeRoute = value)
+        "scoreCheck" -> copy(scoreCheck = value)
+        "ticketClear" -> copy(ticketClear = value)
+        "teamPlan" -> copy(teamPlan = value)
+        else -> this
+    }
+
+    /** 设置页展示用的开关清单（键名 → 中文名）。 */
+    val toggleKeys: List<Pair<String, String>> get() = listOf(
+        "event" to "事件选择",
+        "relicChoice" to "遗物三选一",
+        "ticketChoice" to "印记三选一",
+        "roleChoice" to "角色三选一",
+        "openingRoster" to "开局选人",
+        "openingFilter" to "开局筛选",
+        "nodeRoute" to "寻路",
+        "scoreCheck" to "分数判断",
+        "ticketClear" to "清票",
+        "teamPlan" to "编队",
+    )
+}
 
 /** 黎明界决策系统网关：把共享 SPI 决策点映射到本机 LDS HTTP 协议；noop/失败/动作不符一律返回 null 回退内置。 */
 class LdsDecisionGateway(
     endpoint: String,
-    private val toggles: LdsDecisionToggles,
+    toggles: LdsDecisionToggles,
     private val client: LdsDecisionClient = LdsDecisionClient(endpoint),
 ) : LabyrinthDecisionGateway {
 
     @Volatile var runContext: LdsRunContext? = null
         private set
 
+    @Volatile private var toggles = toggles
+
     /** 喂入/更新本局上下文；传 null 清空，全部决策回退内置。 */
     fun updateRunContext(context: LdsRunContext?) { runContext = context }
+
+    /** 设置页热更新：端点与各类开关立即生效，不重建连接池。 */
+    fun updateConfig(endpoint: String, toggles: LdsDecisionToggles) {
+        client.updateEndpoint(endpoint)
+        this.toggles = toggles
+    }
 
     override fun eventChoice(request: EventChoiceRequest): SelectOutcome? {
         if (!toggles.enabled || !toggles.event) return null

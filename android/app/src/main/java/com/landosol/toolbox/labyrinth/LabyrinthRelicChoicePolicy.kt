@@ -1,5 +1,6 @@
 package com.landosol.toolbox.labyrinth
 
+import com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway
 import com.landosol.toolbox.labyrinth.vision.LabyrinthRelicMatch
 import kotlinx.serialization.Serializable
 
@@ -86,6 +87,8 @@ class LabyrinthRelicChoicePolicy(
         lockedFocus: LabyrinthRelicMark? = null,
         calibratedStacks: Map<LabyrinthRelicMark, Int> = emptyMap(),
         currentArea: Int? = null,
+        /** 外部决策网关；null 或返回 null 时回退内置启发式。商店等其他调用方不传网关。 */
+        gateway: LabyrinthDecisionGateway? = null,
     ): LabyrinthRelicChoiceDecision? {
         val stacks = markStacks(acquired, calibratedStacks)
         val ownedIds = acquired.map { it.relicId }.toSet()
@@ -119,6 +122,34 @@ class LabyrinthRelicChoicePolicy(
             debuff
         } else {
             retainedFocus ?: preferredUnfinished ?: highestUnfinished ?: debuff
+        }
+
+        // 外部决策接管：只把可靠识别的候选按画面序号提供给网关；返回的选项若对应未识别卡片，
+        // 无法安全点击，回退内置。choiceNum 即候选列表序号（1 起），与事件决策的 slot 约定一致。
+        if (gateway != null) {
+            val offered = candidates.mapIndexedNotNull { index, match ->
+                if (!match.recognized) return@mapIndexedNotNull null
+                val id = match.relicId?.trim()?.toLongOrNull()?.takeIf { it > 0 } ?: return@mapIndexedNotNull null
+                val bonus = match.attributeBonus?.trim()?.toIntOrNull()?.takeIf { it > 0 } ?: return@mapIndexedNotNull null
+                LabyrinthDecisionGateway.RelicChoiceRequest.Candidate(choiceNum = index + 1, id = id, count = bonus)
+            }
+            if (offered.isNotEmpty()) {
+                gateway.relicChoice(LabyrinthDecisionGateway.RelicChoiceRequest(
+                    kind = LabyrinthDecisionGateway.RelicChoiceRequest.Kind.RELIC,
+                    choices = offered,
+                ))?.let { outcome ->
+                    val match = candidates.getOrNull(outcome.choiceNum - 1)
+                    if (match != null && offered.any { it.choiceNum == outcome.choiceNum }) {
+                        return LabyrinthRelicChoiceDecision(
+                            choice = match,
+                            phase = LabyrinthRelicChoicePhase.REACH_ANY_FIFTEEN,
+                            stacksBefore = stacks,
+                            focusMark = focus,
+                            reason = "外部决策服务选择遗物选项${outcome.choiceNum}",
+                        )
+                    }
+                }
+            }
         }
 
         val immediateCapstone = recognized

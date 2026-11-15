@@ -1,5 +1,6 @@
 package com.landosol.toolbox.labyrinth
 
+import com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway
 import com.landosol.toolbox.labyrinth.vision.EntryPixelRect
 import com.landosol.toolbox.labyrinth.vision.EntryReferenceRect
 import com.landosol.toolbox.labyrinth.vision.EntryReferenceSize
@@ -50,6 +51,8 @@ sealed interface LabyrinthRoleRewardChoiceDecision {
 class LabyrinthRoleRewardChoicePlanner(
     private val profiles: Map<String, LabyrinthRoleProfile>,
     private val roleChoicePolicy: LabyrinthRoleChoicePolicy,
+    /** 外部决策网关；null 或返回 null 时回退内置评分模型。 */
+    private val gateway: LabyrinthDecisionGateway? = null,
 ) {
     init {
         require(profiles.keys.all { it.isNotBlank() })
@@ -92,6 +95,35 @@ class LabyrinthRoleRewardChoicePlanner(
             })
         val incompleteIds = (candidateIds + canonicalAcquiredIds).distinct()
             .filterNot { knownProfiles.getValue(it).isStrictDecisionReady }.sorted()
+        // 外部决策接管：LDS 的 unit_choice 要求恰好三个候选，识别不齐时保持内置路径。
+        if (gateway != null && safeCandidates.size == SLOT_IDS.size) {
+            gateway.roleChoice(LabyrinthDecisionGateway.RoleChoiceRequest(
+                choices = candidateIds.mapIndexed { index, id ->
+                    LabyrinthDecisionGateway.RoleChoiceRequest.Candidate(
+                        choiceNum = index + 1,
+                        unitId = LabyrinthDecisionGateway.gameUnitId(id),
+                    )
+                },
+                bossQuestIds = emptyList(),
+                futureExRegions = emptyList(),
+            ))?.let { outcome ->
+                val chosenId = candidateIds.getOrNull(outcome.choiceNum - 1) ?: return@let
+                val profile = knownProfiles[chosenId] ?: return@let
+                return LabyrinthOneRoleDecision.Ready(
+                    chosen = profile,
+                    rankings = emptyList(),
+                    reasons = listOf("外部决策服务选择选项${outcome.choiceNum}"),
+                ).toSelection(
+                    candidates = safeCandidates,
+                    frameWidth = frameWidth,
+                    frameHeight = frameHeight,
+                    actionSafe = true,
+                    safetyNote = weak.singleOrNull()?.let {
+                        "${it.slotId}头像未达到安全线，已忽略该卡并在剩余可靠候选中按外部决策选择"
+                    },
+                )
+            }
+        }
         val choice = roleChoicePolicy.chooseOneRole(
             candidateIds = candidateIds,
             acquiredCharacterIds = canonicalAcquiredIds,
@@ -258,7 +290,8 @@ private val COMBINED_MEMBER_TO_CANONICAL_ROLE = mapOf(
     "1282" to "1811",
 )
 
-internal fun canonicalLabyrinthRoleId(characterId: String): String =
+/** 合并成员卡按同模型人物归并后的规范角色 ID；对外部决策服务的角色识别也按它发送。 */
+fun canonicalLabyrinthRoleId(characterId: String): String =
     COMBINED_MEMBER_TO_CANONICAL_ROLE[characterId] ?: characterId
 
 private fun formatConfidence(value: Double): String = "%.3f".format(value)

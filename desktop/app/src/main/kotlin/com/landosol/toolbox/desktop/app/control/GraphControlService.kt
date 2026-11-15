@@ -341,6 +341,19 @@ class GraphControlService(
                 check(WindowsDpapi.unprotect(WindowsDpapi.protect(fixture, entropy), entropy).contentEquals(fixture))
                 "DPAPI 当前用户自检通过"
             })
+            ControlOps.LDS_CONFIG_LOAD -> return buildJsonObject {
+                put("config", model(graph.ldsDecisionConfigSnapshot()))
+            }
+            ControlOps.LDS_CONFIG_SAVE -> {
+                graph.persistLdsDecisionConfig(
+                    decode<com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig>(args.required("config")))
+            }
+            ControlOps.LDS_PING -> return message(withContext(Dispatchers.IO) {
+                val endpoint = args.requiredString("endpoint")
+                if (com.landosol.toolbox.desktop.app.decision.LdsDecisionClient(endpoint).ping()) {
+                    "决策服务可连接：$endpoint"
+                } else "无法连接决策服务（TCP 探测失败）：$endpoint"
+            })
             ControlOps.HISTORY_LOAD -> return buildJsonObject { put("items", model(graph.ux.history.records.value)) }
             ControlOps.LOG_LOAD -> return buildJsonObject { put("items", model(graph.log.lines.value)) }
             ControlOps.CRASHES_LOAD -> {

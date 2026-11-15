@@ -12,11 +12,17 @@ import java.util.concurrent.TimeUnit
 
 /** LDS 本机 HTTP 客户端：阻塞式实现，调用方在后台线程使用；失败返回 null/false，类内不做重试。 */
 class LdsDecisionClient(endpoint: String) {
-    private val base = endpoint.trimEnd('/')
-    private val address = URI(base).run { InetSocketAddress(host, if (port > 0) port else if (scheme == "https") 443 else 80) }
+    @Volatile private var base = endpoint.trimEnd('/')
+    @Volatile private var address = resolveAddress(base)
     private val http = OkHttpClient.Builder().proxy(Proxy.NO_PROXY)
         .connectTimeout(CONNECT_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
         .readTimeout(15, TimeUnit.SECONDS).writeTimeout(15, TimeUnit.SECONDS).build()
+
+    /** 设置页热更新端点；后续请求立即生效。 */
+    fun updateEndpoint(endpoint: String) {
+        base = endpoint.trimEnd('/')
+        address = resolveAddress(base)
+    }
 
     /** POST /labyrinth/decision：HTTP 200 返回报文，其他状态或异常返回 null（协议错误也按失败降级）。 */
     fun postDecision(json: String, uid: Long): String? = try {
@@ -38,6 +44,9 @@ class LdsDecisionClient(endpoint: String) {
             .post(png.toRequestBody("image/png".toMediaType())).build()
         ).execute().use { it.code == 201 }
     } catch (ignored: Exception) { false }
+
+    private fun resolveAddress(base: String): InetSocketAddress =
+        URI(base).run { InetSocketAddress(host, if (port > 0) port else if (scheme == "https") 443 else 80) }
 
     private companion object { const val CONNECT_TIMEOUT_MILLIS = 2_000L }
 }

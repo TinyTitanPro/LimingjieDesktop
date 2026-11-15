@@ -227,6 +227,8 @@ class LabyrinthController(
     private val afterStandaloneReroll: suspend (accountId: Long) -> Unit = {},
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main),
     private val configurationGate: com.landosol.toolbox.automation.TaskConfigurationGate = com.landosol.toolbox.automation.TaskConfigurationGate(),
+    /** 外部决策网关；null 时刷开局筛选走内置路线条件（Android 默认）。 */
+    private val labyrinthDecisionGateway: com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway? = null,
 ) {
     // 缺少国服游戏包时，首页构造本 Controller 不应触发 BilibiliSDK 的包查询。
     // 协调器改为按需解析：仅在登录/验证码等真实操作走到时才求值。
@@ -520,6 +522,7 @@ class LabyrinthController(
                     api = BilibiliLabyrinthApi(session),
                     routeStore = RoomLabyrinthRouteStore(database),
                     checkpointStore = RoomLabyrinthRerollCheckpointStore(database),
+                    gateway = labyrinthDecisionGateway,
                 )
                 val result = workflow.run(config) { progress ->
                     chrome.update {
@@ -649,6 +652,7 @@ class LabyrinthController(
                         api = BilibiliLabyrinthApi(session),
                         routeStore = RoomLabyrinthRouteStore(database),
                         checkpointStore = RoomLabyrinthRerollCheckpointStore(database),
+                        gateway = labyrinthDecisionGateway,
                     )
                     val workflowResult = workflow.run(config) { progress ->
                         chrome.update {

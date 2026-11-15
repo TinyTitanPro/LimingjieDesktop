@@ -401,18 +401,48 @@ class DesktopAppGraph(
     val clanBattleRecognitionSession by lazy {
         ClanBattleRecognitionSession(automationSessionManager, overlayCoordinator = automationOverlayCoordinator)
     }
-    /** 外部决策网关（黎明界决策系统协议）；默认关闭，偏好 `labyrinth-decision/config.v1` 打开。 */
-    val labyrinthDecisionGateway by lazy {
-        val config = com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig.decode(
+    /** 外部决策网关（黎明界决策系统协议）；配置存于 `labyrinth-decision` 偏好，设置页可热更新。 */
+    @Volatile private var labyrinthDecisionGatewayRef: com.landosol.toolbox.desktop.app.decision.LdsDecisionGateway? = null
+    private var labyrinthDecisionGatewayInitialized = false
+    val labyrinthDecisionGateway: com.landosol.toolbox.desktop.app.decision.LdsDecisionGateway?
+        get() = synchronized(this) {
+            if (!labyrinthDecisionGatewayInitialized) {
+                labyrinthDecisionGatewayInitialized = true
+                applyLdsDecisionConfig(com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig.decode(
+                    context.getSharedPreferences("labyrinth-decision", android.content.Context.MODE_PRIVATE)
+                        .getString("config.v1", null),
+                ))
+            }
+            labyrinthDecisionGatewayRef
+        }
+
+    /** 设置页热更新入口：enabled=false 时清空上下文并回退全部内置决策。 */
+    fun applyLdsDecisionConfig(config: com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig) {
+        val current = labyrinthDecisionGatewayRef
+        if (!config.enabled) {
+            current?.updateRunContext(null)
+            labyrinthDecisionGatewayRef = null
+        } else if (current != null) {
+            current.updateConfig(config.endpoint, config.toggles)
+        } else {
+            labyrinthDecisionGatewayRef =
+                com.landosol.toolbox.desktop.app.decision.LdsDecisionGateway(config.endpoint, config.toggles)
+        }
+    }
+
+    fun persistLdsDecisionConfig(config: com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig) {
+        val raw = com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig.encode(config)
+        context.getSharedPreferences("labyrinth-decision", android.content.Context.MODE_PRIVATE)
+            .edit().putString("config.v1", raw).apply()
+        applyLdsDecisionConfig(config)
+    }
+
+    /** 设置页读取当前持久化配置（与网关实例状态无关）。 */
+    fun ldsDecisionConfigSnapshot(): com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig =
+        com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig.decode(
             context.getSharedPreferences("labyrinth-decision", android.content.Context.MODE_PRIVATE)
                 .getString("config.v1", null),
         )
-        if (config.enabled) {
-            com.landosol.toolbox.desktop.app.decision.LdsDecisionGateway(config.endpoint, config.toggles)
-        } else {
-            null
-        }
-    }
     private val labyrinthRoleDecisionData by lazy {
         AndroidLabyrinthRoleDecisionDataLoader(context).load(gateway = labyrinthDecisionGateway)
     }
@@ -488,7 +518,7 @@ class DesktopAppGraph(
                     settings,
                     roleDecisionRuntime?.document?.let { document ->
                         com.landosol.toolbox.labyrinth.LabyrinthRoleDecisionDataParser.createRuntime(
-                            settings.applyTo(document), settings,
+                            settings.applyTo(document), settings, labyrinthDecisionGateway,
                         )
                     },
                 )
@@ -620,7 +650,29 @@ class DesktopAppGraph(
                     runBlocking(Dispatchers.IO) { actionDevice.launch(target) }
                 }
             },
-        )
+        ).also { session ->
+            // 运行上下文采集器：把会话状态/刷开局检查点映射为 LDS 公共字段，喂给决策网关。
+            com.landosol.toolbox.desktop.app.decision.LdsRunContextCollector(
+                sessionState = session.state,
+                selectedAccount = { labyrinthController.uiState.value.selectedAccount },
+                routeLoader = { accountId ->
+                    com.landosol.toolbox.labyrinth.RoomLabyrinthRouteStore(database).loadLatest(accountId)
+                },
+                rerollCheckpointLoader = { accountId ->
+                    com.landosol.toolbox.labyrinth.RoomLabyrinthRerollCheckpointStore(database).load(accountId)
+                        ?.enterId?.let { enterId ->
+                            com.landosol.toolbox.desktop.app.decision.LdsRunContextCollector.RerollCheckpointSnapshot(
+                                enterId = enterId,
+                                difficulty = com.landosol.toolbox.labyrinth.RoomLabyrinthRerollCheckpointStore(database)
+                                    .load(accountId)?.difficulty ?: 0,
+                            )
+                        }
+                },
+                rerollBusy = { labyrinthController.isBusy },
+                gateway = { labyrinthDecisionGateway },
+                scope = autoRunScope,
+            ).start()
+        }
     }
 
     val database: AppDatabase by lazy { openedDatabase ?: AppDatabase.create(context) }
@@ -710,6 +762,7 @@ class DesktopAppGraph(
             scope = mainScope,
             beforeRerollLogin = { accountId -> withContext(Dispatchers.IO) { hardCloseChannelClientBeforeReroll(accountId) } },
             afterStandaloneReroll = { accountId -> coldStartChannelClientAfterReroll(accountId) },
+            labyrinthDecisionGateway = labyrinthDecisionGateway,
         )
     }
 

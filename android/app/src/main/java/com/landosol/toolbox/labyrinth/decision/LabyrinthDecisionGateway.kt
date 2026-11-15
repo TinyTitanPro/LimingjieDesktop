@@ -178,5 +178,12 @@ interface LabyrinthDecisionGateway {
     companion object {
         /** 空网关：全部回退内置逻辑。 */
         val NONE: LabyrinthDecisionGateway = object : LabyrinthDecisionGateway {}
+
+        /**
+         * 游戏完整单位 ID：角色基础 ID×100+1（初始立绘，如 1025→102501）。
+         * 外部决策服务按该主键识别角色；无法解析时返回 0，调用方不得发送。
+         */
+        fun gameUnitId(characterId: String): Long =
+            characterId.toLongOrNull()?.takeIf { it in 1..999999 }?.let { it * 100 + 1 } ?: 0L
     }
 }

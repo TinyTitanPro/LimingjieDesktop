@@ -45,6 +45,8 @@ data class LabyrinthRoleDecisionRuntime(
     val teamPlanSearcher: LabyrinthTeamPlanSearcher,
     val battleTeamRecommendationPlanner: LabyrinthBattleTeamRecommendationPlanner,
     val battleTeamSelectionPlanner: LabyrinthBattleTeamSelectionPlanner,
+    /** 外部决策网关；null 时全部决策点走内置逻辑。执行层据此直接咨询其余决策点。 */
+    val decisionGateway: LabyrinthDecisionGateway? = null,
 )
 
 sealed interface LabyrinthRoleDecisionDataResult {
@@ -97,7 +99,7 @@ object LabyrinthRoleDecisionDataParser {
         return LabyrinthRoleDecisionRuntime(
             document = document,
             profiles = profiles,
-            rewardChoicePlanner = LabyrinthRoleRewardChoicePlanner(profiles, policy),
+            rewardChoicePlanner = LabyrinthRoleRewardChoicePlanner(profiles, policy, gateway),
             eventChoicePlanner = LabyrinthEventChoicePlanner(profiles, optimizer, strategy, gateway),
             teamPlanSearcher = teamPlanSearcher,
             battleTeamRecommendationPlanner = LabyrinthBattleTeamRecommendationPlanner(
@@ -105,6 +107,7 @@ object LabyrinthRoleDecisionDataParser {
                 teamPlanSearcher = teamPlanSearcher,
             ),
             battleTeamSelectionPlanner = LabyrinthBattleTeamSelectionPlanner(profiles),
+            decisionGateway = gateway,
         )
     }
 }
