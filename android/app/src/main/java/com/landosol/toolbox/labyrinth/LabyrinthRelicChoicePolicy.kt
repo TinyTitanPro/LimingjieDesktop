@@ -130,8 +130,7 @@ class LabyrinthRelicChoicePolicy(
             val offered = candidates.mapIndexedNotNull { index, match ->
                 if (!match.recognized) return@mapIndexedNotNull null
                 val id = match.relicId?.trim()?.toLongOrNull()?.takeIf { it > 0 } ?: return@mapIndexedNotNull null
-                val bonus = match.attributeBonus?.trim()?.toIntOrNull()?.takeIf { it > 0 } ?: return@mapIndexedNotNull null
-                LabyrinthDecisionGateway.RelicChoiceRequest.Candidate(choiceNum = index + 1, id = id, count = bonus)
+                LabyrinthDecisionGateway.RelicChoiceRequest.Candidate(choiceNum = index + 1, id = id, count = 1)
             }
             if (offered.isNotEmpty()) {
                 gateway.relicChoice(LabyrinthDecisionGateway.RelicChoiceRequest(
@@ -142,7 +141,13 @@ class LabyrinthRelicChoicePolicy(
                     if (match != null && offered.any { it.choiceNum == outcome.choiceNum }) {
                         return LabyrinthRelicChoiceDecision(
                             choice = match,
-                            phase = LabyrinthRelicChoicePhase.REACH_ANY_FIFTEEN,
+                            phase = if (currentArea != null && currentArea in 1..config.baselineLastArea &&
+                                stacks.values.any { it < config.baselineTarget }
+                            ) {
+                                LabyrinthRelicChoicePhase.BUILD_BASELINE
+                            } else {
+                                LabyrinthRelicChoicePhase.REACH_ANY_FIFTEEN
+                            },
                             stacksBefore = stacks,
                             focusMark = focus,
                             reason = "外部决策服务选择遗物选项${outcome.choiceNum}",

@@ -10,13 +10,13 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /** The five element types displayed on a link-mark choice card. */
-enum class LabyrinthLinkElement(val label: String) {
-    FIRE("火"),
-    DARK("暗"),
-    LIGHT("光"),
-    WIND("风"),
-    WATER("水"),
-    UNKNOWN("未知"),
+enum class LabyrinthLinkElement(val label: String, /** 游戏属性（talent）ID：1 火、2 水、3 风、4 光、5 暗；未知为 0。 */ val talentId: Int) {
+    FIRE("火", 1),
+    DARK("暗", 5),
+    LIGHT("光", 4),
+    WIND("风", 3),
+    WATER("水", 2),
+    UNKNOWN("未知", 0),
 }
 
 /**

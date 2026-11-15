@@ -726,9 +726,10 @@ class LabyrinthRerollWorkflow(
             )
             // 外部决策先于内置路线条件：Accept 放行给本地匹配（执行层仍需要可走的路线文档），
             // Retry/Stop 由网关的筛选配置决定；无网关或上下文不可得时保持内置判定。
+            // 本地 attempt 从 0 起，协议要求从 1 起，单独换算避免污染检查点语义。
             when (val external = entered.map.takeIf { it.isNotEmpty() }?.let { map ->
                 gateway?.openingFilter(LabyrinthDecisionGateway.OpeningFilterRequest(
-                    attempt = attempt,
+                    attempt = attempt + 1,
                     blocks = map.map(LabyrinthMapNode::toGatewayBlock),
                 ))
             }) {

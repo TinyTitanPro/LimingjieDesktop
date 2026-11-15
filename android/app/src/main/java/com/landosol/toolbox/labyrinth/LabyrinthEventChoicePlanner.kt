@@ -152,15 +152,20 @@ class LabyrinthEventChoicePlanner(
             )
         }
         if (gateway != null) {
+            // 已拒绝（点击后页面未变化）与无法解析选项 ID 的候选不进入请求：服务端只能在
+            // 我们上报的选项里选，避免它反复返回一个点不动的付费/无效分支。
+            val offered = event.choices.filter { choice ->
+                choice.id !in rejectedChoiceIds && (choice.id.toLongOrNull() ?: 0L) > 0
+            }
             gateway.eventChoice(
                 LabyrinthDecisionGateway.EventChoiceRequest(
                     eventId = event.id.toLongOrNull() ?: return LabyrinthEventChoiceDecision.Wait("事件${event.id}ID非数字，外部决策跳过"),
-                    options = event.choices.map { choice ->
+                    options = offered.map { choice ->
                         LabyrinthDecisionGateway.EventChoiceRequest.EventOption(
                             choiceNum = choice.slot,
                             choiceId = choice.id.toLongOrNull() ?: 0L,
-                            conditionType = 0,
-                            conditionValue = 0L,
+                            conditionType = choice.conditionType,
+                            conditionValue = choice.conditionValue.toLong(),
                             unitId = 0L,
                         )
                     },

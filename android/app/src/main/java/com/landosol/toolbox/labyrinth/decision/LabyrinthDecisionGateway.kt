@@ -185,5 +185,12 @@ interface LabyrinthDecisionGateway {
          */
         fun gameUnitId(characterId: String): Long =
             characterId.toLongOrNull()?.takeIf { it in 1..999999 }?.let { it * 100 + 1 } ?: 0L
+
+        /**
+         * 连结印记（属性券）物品 ID：31100000 + (talentId-1)×100000。
+         * talentId 口径与游戏数据一致：1 火、2 水、3 风、4 光、5 暗；
+         * 服务端按 (ticket_id/100000)%10 反解属性优先级。
+         */
+        fun ticketItemId(talentId: Int): Long = 31_100_000L + (talentId - 1).coerceIn(0, 4) * 100_000L
     }
 }

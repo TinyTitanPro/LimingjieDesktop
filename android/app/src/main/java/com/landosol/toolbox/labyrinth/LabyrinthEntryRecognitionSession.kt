@@ -6407,15 +6407,37 @@ class LabyrinthEntryRecognitionSession(
                     null
                 }
 
-            LabyrinthEntryPageState.LINK_CHOICE ->
-                (result.linkChoiceSelection?.preferredChoice
-                    ?: result.linkChoiceSelection?.choices?.firstOrNull())?.let { choice ->
+            LabyrinthEntryPageState.LINK_CHOICE -> {
+                val link = result.linkChoiceSelection
+                // 外部决策接管：只上报可靠识别的印记，服务端按属性优先级返回序号；未识别卡片
+                // 无法安全点击，不进入请求，返回 null 时回退内置属性优先级。
+                val external = if (decisionGateway == null || link == null) {
+                    null
+                } else {
+                    val offered = link.choices.filter { it.recognized }
+                    if (offered.isEmpty()) null else decisionGateway?.ticketChoice(
+                        LabyrinthDecisionGateway.RelicChoiceRequest(
+                            kind = LabyrinthDecisionGateway.RelicChoiceRequest.Kind.TICKET,
+                            choices = offered.mapIndexed { index, choice ->
+                                LabyrinthDecisionGateway.RelicChoiceRequest.Candidate(
+                                    choiceNum = index + 1,
+                                    id = LabyrinthDecisionGateway.ticketItemId(choice.element.talentId),
+                                    count = 1,
+                                )
+                            },
+                        ),
+                    )?.let { outcome -> offered.getOrNull(outcome.choiceNum - 1) }
+                }
+                (external ?: link?.preferredChoice
+                    ?: link?.choices?.firstOrNull())?.let { choice ->
                     LabyrinthPostEntryTapPlan(
                         LabyrinthPostEntryActionKind.SELECT_LINK_IMPRINT,
-                        "选择连结印记：${choice.element.label}",
+                        "选择连结印记：${choice.element.label}" +
+                            if (external != null) "（外部决策）" else "",
                         choice.selectionButtonRect,
                     )
                 }
+            }
 
             LabyrinthEntryPageState.RELIC_CHOICE -> {
                 if (relicChoiceCommitted &&
