@@ -1,6 +1,7 @@
 package com.landosol.toolbox.labyrinth
 
 import com.landosol.toolbox.gamedata.EventChoiceResource
+import com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway
 import com.landosol.toolbox.labyrinth.vision.EntryPixelRect
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEventChoiceObservation
 import com.landosol.toolbox.labyrinth.vision.LabyrinthArenaEvent
@@ -27,6 +28,8 @@ class LabyrinthEventChoicePlanner(
     private val profiles: Map<String, LabyrinthRoleProfile>,
     private val optimizer: LabyrinthTeamOptimizer,
     private val strategy: LabyrinthStrategySettings = LabyrinthStrategySettings(),
+    /** 外部决策网关；null 或返回 null 时回退内置收益模型。 */
+    private val gateway: LabyrinthDecisionGateway? = null,
 ) {
     private val evaluationCache = linkedMapOf<String, List<EvaluatedChoice>>()
     private val effectiveOverrides = strategy.effectiveEventChoiceOverrides()
@@ -147,6 +150,38 @@ class LabyrinthEventChoicePlanner(
             return LabyrinthEventChoiceDecision.Wait(
                 "事件${event.id}的${event.choices.size}个选项都已点击且页面未变化，没有可执行选项",
             )
+        }
+        if (gateway != null) {
+            gateway.eventChoice(
+                LabyrinthDecisionGateway.EventChoiceRequest(
+                    eventId = event.id.toLongOrNull() ?: return LabyrinthEventChoiceDecision.Wait("事件${event.id}ID非数字，外部决策跳过"),
+                    options = event.choices.map { choice ->
+                        LabyrinthDecisionGateway.EventChoiceRequest.EventOption(
+                            choiceNum = choice.slot,
+                            choiceId = choice.id.toLongOrNull() ?: 0L,
+                            conditionType = 0,
+                            conditionValue = 0L,
+                            unitId = 0L,
+                        )
+                    },
+                ),
+            )?.let { outcome ->
+                val visual = observation.choices.filter {
+                    it.choice.id !in rejectedChoiceIds &&
+                        it.enabledConfidence >= MINIMUM_ENABLED_BUTTON_CONFIDENCE
+                }.firstOrNull { it.choice.slot == outcome.choiceNum }
+                    ?: return LabyrinthEventChoiceDecision.Wait("外部决策选项${outcome.choiceNum}当前没有可用按钮")
+                return LabyrinthEventChoiceDecision.Select(
+                    eventId = event.id,
+                    choiceId = visual.choice.id,
+                    label = visual.choice.name,
+                    buttonRect = visual.buttonRect,
+                    utility = 0.0,
+                    explanation = "外部决策服务选择选项${outcome.choiceNum}",
+                    actionSafe = observation.trusted && observation.stableFrames >= 2,
+                    safetyNote = if (!observation.trusted) "事件文字尚未连续稳定确认" else null,
+                )
+            }
         }
         val canonicalAcquired = acquiredCharacterIds.map(::canonicalLabyrinthRoleId).toSet()
         val cacheKey = buildString {

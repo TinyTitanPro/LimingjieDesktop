@@ -401,8 +401,20 @@ class DesktopAppGraph(
     val clanBattleRecognitionSession by lazy {
         ClanBattleRecognitionSession(automationSessionManager, overlayCoordinator = automationOverlayCoordinator)
     }
+    /** 外部决策网关（黎明界决策系统协议）；默认关闭，偏好 `labyrinth-decision/config.v1` 打开。 */
+    val labyrinthDecisionGateway by lazy {
+        val config = com.landosol.toolbox.desktop.app.decision.LdsDecisionConfig.decode(
+            context.getSharedPreferences("labyrinth-decision", android.content.Context.MODE_PRIVATE)
+                .getString("config.v1", null),
+        )
+        if (config.enabled) {
+            com.landosol.toolbox.desktop.app.decision.LdsDecisionGateway(config.endpoint, config.toggles)
+        } else {
+            null
+        }
+    }
     private val labyrinthRoleDecisionData by lazy {
-        AndroidLabyrinthRoleDecisionDataLoader(context).load()
+        AndroidLabyrinthRoleDecisionDataLoader(context).load(gateway = labyrinthDecisionGateway)
     }
     val labyrinthStrategySettings by lazy {
         com.landosol.toolbox.desktop.app.adapters.storage.DesktopStrategyStore(dataDirectory,

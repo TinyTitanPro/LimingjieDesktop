@@ -8,6 +8,7 @@ import java.util.zip.ZipOutputStream
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.compose)
 }
@@ -18,6 +19,7 @@ dependencies {
     implementation(project(":shared")); implementation(project(":device")); implementation(project(":ocr")); implementation(project(":platform"))
     implementation(compose.desktop.currentOs); implementation(compose.material3)
     implementation(kotlin("reflect"))
+    implementation(libs.okhttp); implementation(libs.serialization.json)
     testImplementation(libs.junit)
     testImplementation(compose.desktop.uiTestJUnit4)
 }

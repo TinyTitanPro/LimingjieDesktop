@@ -22,6 +22,19 @@ Upstream project: <https://github.com/cc004/autopcr>
 
 Upstream license: [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International](https://github.com/cc004/autopcr/blob/main/LICENSE).
 
+## PCR_Labyrinth_Decision_System (optional decision service)
+
+The desktop app can delegate labyrinth decisions to an external local
+service, PCR_Labyrinth_Decision_System (黎明界决策系统), over its documented
+HTTP JSON protocol on 127.0.0.1. The service is a separate AGPL-3.0 program:
+it is not bundled, not linked, and not modified by this project; integration
+is interoperability only. Install and run it separately from its releases.
+
+Upstream project: <https://github.com/Lanly109/PCR_Labyrinth_Decision_System>
+
+Upstream license: [GNU Affero General Public License v3.0](https://github.com/Lanly109/PCR_Labyrinth_Decision_System/blob/main/LICENSE).
+
+
 ## 花阳亲的米团子
 
 The Labyrinth opening-reroll approach also references 花阳亲的米团子 (Go, CC BY-NC-SA 4.0),

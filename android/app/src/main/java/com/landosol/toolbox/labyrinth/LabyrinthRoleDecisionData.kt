@@ -1,5 +1,6 @@
 package com.landosol.toolbox.labyrinth
 
+import com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
@@ -57,7 +58,11 @@ object LabyrinthRoleDecisionDataParser {
         isLenient = false
     }
 
-    fun parse(raw: String): LabyrinthRoleDecisionDataResult = runCatching {
+    fun parse(
+        raw: String,
+        strategy: LabyrinthStrategySettings = LabyrinthStrategySettings(),
+        gateway: LabyrinthDecisionGateway? = null,
+    ): LabyrinthRoleDecisionDataResult = runCatching {
         val document = json.decodeFromString<LabyrinthRoleDecisionDocument>(raw)
         require(document.schemaVersion in LabyrinthRoleDecisionDocument.SUPPORTED_SCHEMA_VERSIONS) {
             "不支持的角色决策资料版本：${document.schemaVersion}"
@@ -68,7 +73,7 @@ object LabyrinthRoleDecisionDataParser {
             .filterValues { it > 1 }
             .keys
         require(duplicateIds.isEmpty()) { "角色决策资料存在重复ID：${duplicateIds.sorted().joinToString()}" }
-        createRuntime(document)
+        createRuntime(document, strategy, gateway)
     }.fold(
         onSuccess = { LabyrinthRoleDecisionDataResult.Ready(it) },
         onFailure = { failure ->
@@ -81,6 +86,8 @@ object LabyrinthRoleDecisionDataParser {
     fun createRuntime(
         document: LabyrinthRoleDecisionDocument,
         strategy: LabyrinthStrategySettings = LabyrinthStrategySettings(),
+        /** 外部决策网关；null 时全部决策点走内置逻辑（Android 默认）。 */
+        gateway: LabyrinthDecisionGateway? = null,
     ): LabyrinthRoleDecisionRuntime {
         val profiles = document.characters.associateBy(LabyrinthRoleProfile::characterId)
         val scorer = LabyrinthTeamScorer(document.scoring)
@@ -91,7 +98,7 @@ object LabyrinthRoleDecisionDataParser {
             document = document,
             profiles = profiles,
             rewardChoicePlanner = LabyrinthRoleRewardChoicePlanner(profiles, policy),
-            eventChoicePlanner = LabyrinthEventChoicePlanner(profiles, optimizer, strategy),
+            eventChoicePlanner = LabyrinthEventChoicePlanner(profiles, optimizer, strategy, gateway),
             teamPlanSearcher = teamPlanSearcher,
             battleTeamRecommendationPlanner = LabyrinthBattleTeamRecommendationPlanner(
                 profiles = profiles,

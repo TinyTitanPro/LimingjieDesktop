@@ -5,10 +5,13 @@ import android.content.Context
 class AndroidLabyrinthRoleDecisionDataLoader(
     private val context: Context,
 ) {
-    fun load(): LabyrinthRoleDecisionDataResult = runCatching {
+    fun load(
+        strategy: LabyrinthStrategySettings = LabyrinthStrategySettings(),
+        gateway: com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway? = null,
+    ): LabyrinthRoleDecisionDataResult = runCatching {
         context.assets.open(ASSET_PATH).bufferedReader().use { it.readText() }
     }.fold(
-        onSuccess = LabyrinthRoleDecisionDataParser::parse,
+        onSuccess = { raw -> LabyrinthRoleDecisionDataParser.parse(raw, strategy, gateway) },
         onFailure = { failure ->
             LabyrinthRoleDecisionDataResult.Unavailable(
                 "未加载角色决策资料 $ASSET_PATH：${failure.message ?: "文件不存在"}",
