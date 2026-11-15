@@ -3319,6 +3319,7 @@ class LabyrinthEntryRecognitionSession(
             guildId = validatedRoute?.guildId,
             openingRosters = configuredOpeningRosters,
             displayNameFor = { id -> roleDisplayNames[id] },
+            decisionGateway = decisionGateway,
         )
         planner.start(clock())
     }

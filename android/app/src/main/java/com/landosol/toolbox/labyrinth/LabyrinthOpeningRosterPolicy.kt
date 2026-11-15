@@ -1,5 +1,7 @@
 package com.landosol.toolbox.labyrinth
 
+import com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway
+
 /** One mandatory opening slot. The first available candidate wins. */
 data class LabyrinthOpeningRosterSlot(
     val candidates: List<LabyrinthOpeningCharacter>,
@@ -59,7 +61,41 @@ sealed interface LabyrinthOpeningRosterDecision {
 /** Resolves the three configured slots without replacing unavailable choices with unrelated roles. */
 class LabyrinthOpeningRosterPolicy(
     private val config: LabyrinthOpeningRosterConfig,
+    /** 外部决策网关；null、上下文缺失或未返回可用计划时全部槽位走内置顺位。 */
+    private val gateway: LabyrinthDecisionGateway? = null,
 ) {
+    /**
+     * 外部决策计划：构造时咨询一次（此时路线文档已就位，运行上下文已含本局 enterId），
+     * 网关返回的单位 ID 解析回本目录可点击候选；解析失败或重复的条目直接丢弃。
+     */
+    private val externalPlan: List<LabyrinthOpeningCharacter> = consultGatewayPlan()
+
+    private fun consultGatewayPlan(): List<LabyrinthOpeningCharacter> {
+        val gateway = gateway ?: return emptyList()
+        val ticketId = LabyrinthOpeningRosterCatalog.ticketIdFor(config.guildId) ?: return emptyList()
+        val candidates = config.slots.flatMap { it.candidates }
+            .map { LabyrinthDecisionGateway.gameUnitId(canonicalLabyrinthRoleId(it.characterId)) }
+            .filter { it > 0 }
+            .distinct()
+        if (candidates.size < LabyrinthOpeningRosterConfig.REQUIRED_OPENING_CHARACTERS) return emptyList()
+        val unitIds = gateway.openingRoster(LabyrinthDecisionGateway.OpeningRosterRequest(
+            selectCount = LabyrinthOpeningRosterConfig.REQUIRED_OPENING_CHARACTERS,
+            ticketId = ticketId,
+            candidateUnitIds = candidates,
+        ))?.unitIds.orEmpty()
+        return unitIds.mapNotNull { unitId ->
+            val baseId = (unitId / 100).toString()
+            config.slots.asSequence().flatMap { it.candidates.asSequence() }
+                .firstOrNull { canonicalLabyrinthRoleId(it.characterId) == baseId }
+        }.distinctBy(LabyrinthOpeningCharacter::characterId)
+    }
+
+    /** 本槽的外部首选：计划中属于该槽候选且尚未被更早槽位消费的角色。 */
+    private fun plannedCandidateFor(slot: LabyrinthOpeningRosterSlot, consumed: MutableSet<String>): LabyrinthOpeningCharacter? =
+        externalPlan.firstOrNull { candidate ->
+            candidate.characterId !in consumed && slot.candidates.any { it.characterId == candidate.characterId }
+        }?.also { consumed += it.characterId }
+
     /** True once every mandatory slot is satisfied by one of its configured candidates. */
     fun isSatisfied(selectedCharacterIds: Set<String>): Boolean =
         config.slots.all { slot ->
@@ -84,8 +120,10 @@ class LabyrinthOpeningRosterPolicy(
         availableCharacterIds: Set<String>,
         selectedCharacterIds: Set<String>,
     ): LabyrinthOpeningCharacter? {
+        val consumed = mutableSetOf<String>()
         config.slots.forEach { slot ->
             if (slot.candidates.any { it.characterId in selectedCharacterIds }) return@forEach
+            plannedCandidateFor(slot, consumed)?.takeIf { it.characterId in availableCharacterIds }?.let { return it }
             slot.candidates.firstOrNull { it.characterId in availableCharacterIds }?.let { return it }
         }
         return null
@@ -104,17 +142,21 @@ class LabyrinthOpeningRosterPolicy(
         val selected = mutableListOf<LabyrinthOpeningCharacter>()
         val reasons = mutableListOf<String>()
         val missing = mutableListOf<Int>()
+        val consumed = mutableSetOf<String>()
         config.slots.forEachIndexed { index, slot ->
-            val choice = slot.candidates.firstOrNull { it.characterId in availableCharacterIds }
+            val planned = plannedCandidateFor(slot, consumed)?.takeIf { it.characterId in availableCharacterIds }
+            val choice = planned ?: slot.candidates.firstOrNull { it.characterId in availableCharacterIds }
             if (choice == null) {
                 missing += index + 1
             } else {
                 selected += choice
                 val priority = slot.candidates.indexOf(choice) + 1
-                reasons += if (priority == 1) {
-                    "第${index + 1}槽选择${choice.displayName}（首选）"
-                } else {
-                    "第${index + 1}槽选择${choice.displayName}（第${priority}顺位替代）"
+                reasons += when {
+                    planned != null && priority != 1 ->
+                        "第${index + 1}槽按外部决策选择${choice.displayName}（第${priority}顺位替代）"
+                    planned != null -> "第${index + 1}槽按外部决策选择${choice.displayName}"
+                    priority == 1 -> "第${index + 1}槽选择${choice.displayName}（首选）"
+                    else -> "第${index + 1}槽选择${choice.displayName}（第${priority}顺位替代）"
                 }
             }
         }
@@ -282,8 +324,27 @@ object LabyrinthOpeningRosterCatalog {
         guildId: Int?,
         overrides: Map<Int, List<List<String>>> = emptyMap(),
         displayNameFor: (String) -> String? = { null },
+        decisionGateway: com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway? = null,
     ): LabyrinthOpeningRosterPolicy? =
-        configFor(guildId, overrides, displayNameFor)?.let(::LabyrinthOpeningRosterPolicy)
+        configFor(guildId, overrides, displayNameFor)?.let { LabyrinthOpeningRosterPolicy(it, decisionGateway) }
+
+    /**
+     * 公会开局券主键；来源为国服数据库，经 LDS game_catalog 交叉核对（公会编号语义与本目录
+     * 一致：guild 9 三候选完全相同）。券号与公会号非顺序，无法按数值推导，只能登记。
+     */
+    fun ticketIdFor(guildId: Int): Long? = when (guildId) {
+        1 -> 13000001L
+        2 -> 13000002L
+        3 -> 13000009L
+        4 -> 13000008L
+        5 -> 13000003L
+        6 -> 13000004L
+        7 -> 13000007L
+        8 -> 13000011L
+        9 -> 13000012L
+        10 -> 13000013L
+        else -> null
+    }
 }
 
 /**

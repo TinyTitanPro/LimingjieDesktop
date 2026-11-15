@@ -166,8 +166,9 @@ class LabyrinthEntryActionPlanner(
         guildId: Int?,
         openingRosters: Map<Int, List<List<String>>> = emptyMap(),
         displayNameFor: (String) -> String? = { null },
+        decisionGateway: com.landosol.toolbox.labyrinth.decision.LabyrinthDecisionGateway? = null,
     ) {
-        openingRosterPolicy = LabyrinthOpeningRosterCatalog.policyFor(guildId, openingRosters, displayNameFor)
+        openingRosterPolicy = LabyrinthOpeningRosterCatalog.policyFor(guildId, openingRosters, displayNameFor, decisionGateway)
         selectedOpeningCharacterIds.clear()
         pendingOpeningCharacterId = null
         pendingOpeningCharacterName = null
