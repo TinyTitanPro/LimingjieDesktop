@@ -82,6 +82,7 @@ import com.landosol.toolbox.security.AndroidKeystoreCredentialStore
 import com.landosol.toolbox.security.AndroidKeystoreSdkSessionStore
 import com.landosol.toolbox.labyrinth.LabyrinthEntryRecognitionSession
 import com.landosol.toolbox.labyrinth.debug.LabyrinthDebugDashboardServer
+import com.landosol.toolbox.desktop.app.probe.LabyrinthProbeFastProcessor
 import com.landosol.toolbox.labyrinth.LabyrinthEntryRecognitionStartResult
 import com.landosol.toolbox.labyrinth.LabyrinthAutoRunConfig
 import com.landosol.toolbox.labyrinth.LabyrinthAutoRunWorkflow
@@ -501,6 +502,48 @@ class DesktopAppGraph(
             runtimeDiagnostics = diagnostics,
         ).also { it.start() }.takeIf { it.boundPort != null }
     }
+    /**
+     * 黎明界只读内存探针（frida-inject 经 adb reverse 回连；只读当前视图）。
+     * 识别会话启动时按需创建并注入；探针命中视图页即短路截图识别，未命中/失败回落视觉。
+     * 停止任务或断开设备时关闭。
+     */
+    @Volatile private var memoryProbe: FridaProbeTransport? = null
+    @Volatile private var memoryProbeNoticeShown = false
+
+    private fun ensureMemoryProbe(): FridaProbeTransport? {
+        if (dataOnly) return null
+        memoryProbe?.let { existing ->
+            if (existing.status.value !is ProbeStatus.Idle) return existing
+            existing.close()
+        }
+        val serial = (device.state.value as? DeviceConnectionState.Ready)?.device?.serial ?: return null
+        val target = gamePackageName ?: return null
+        val adbExecutable = runCatching {
+            runBlocking {
+                withTimeout(5000) {
+                    AdbLocator.find(settings.state.value.adbPath, dataDirectory.resolve("tools/platform-tools"))?.path
+                }
+            }
+        }.getOrNull() ?: return null
+        val (transport, reason) = FridaProbeTransport.open(ProcessAdbExecutor(adbExecutable), serial, target, dataDirectory)
+        if (transport == null) {
+            if (!memoryProbeNoticeShown) {
+                memoryProbeNoticeShown = true
+                log.add(reason ?: "内存探针未启用", true)
+            }
+            return null
+        }
+        transport.start()
+        memoryProbe = transport
+        log.add("内存探针已启动（只读当前视图；失败自动回落截图识别）")
+        return transport
+    }
+
+    private fun closeMemoryProbe() {
+        memoryProbe?.close()
+        memoryProbe = null
+    }
+
     val labyrinthEntryRecognitionSession: LabyrinthEntryRecognitionSession by lazy {
         // Start the debug endpoint with its initial waiting snapshot instead of waiting for the
         // first captured frame. That keeps first-frame capture failures observable in the browser.
@@ -581,9 +624,13 @@ class DesktopAppGraph(
                 )::processDesktopFrame
             },
             fastProcessorFactory = {
-                com.landosol.toolbox.labyrinth.vision.AndroidLabyrinthFastFrameObserver.create(
+                val visionProcessor = com.landosol.toolbox.labyrinth.vision.AndroidLabyrinthFastFrameObserver.create(
                     context, com.landosol.toolbox.automation.capture.CaptureStateRegistry::captureSize,
                 )::process
+                ensureMemoryProbe()?.let { probe ->
+                    // 内存探针命中视图页时短路整帧模板匹配；未命中/失败自动回落视觉。
+                    LabyrinthProbeFastProcessor(probe, visionProcessor)
+                } ?: visionProcessor
             },
             fastFramePublisher = debugDashboard?.let { dashboard ->
                 { fast, state -> dashboard.publishFast(fast, state) }
@@ -1162,7 +1209,7 @@ class DesktopAppGraph(
         }
     }
 
-    suspend fun disconnectDevice() { check(!busy) { "请先停止任务" }; resolutionGuard.disarm(clearStatus = true); deviceConnection.disconnect { captureService.stopAndJoin("断开设备") }; previewState.value = null; lastCapturedFrameMillis = 0L }
+    suspend fun disconnectDevice() { check(!busy) { "请先停止任务" }; resolutionGuard.disarm(clearStatus = true); closeMemoryProbe(); deviceConnection.disconnect { captureService.stopAndJoin("断开设备") }; previewState.value = null; lastCapturedFrameMillis = 0L }
     suspend fun recheckResolution(): VisualResolutionStatus {
         check(!busy) { "请先停止任务，再重新检查画面尺寸" }
         return resolutionGuard.recheck().also { log.add(it.message, !it.supported) }
@@ -1211,6 +1258,7 @@ class DesktopAppGraph(
                 labyrinthController.uiState.first { !it.isWorking && it.captcha == null }
             } finally {
                 withContext(NonCancellable) { captureService.stopAndJoin(reason) }
+                closeMemoryProbe()
                 autoRunJob = null
                 startingState.value = false
                 stoppingState.value = false

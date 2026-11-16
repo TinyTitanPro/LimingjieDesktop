@@ -40,3 +40,19 @@ tasks.register<JavaExec>("probeDevice") {
     args(providers.gradleProperty("probeAdb").orElse("").get(), providers.gradleProperty("probeSerial").orElse("").get(),
         providers.gradleProperty("probeOutput").orElse("").get(), providers.gradleProperty("probeMode").orElse("inspect").get())
 }
+
+// Explicit opt-in manual memory probe: verifies frida-inject deployment and read-only page RPC
+// against a real emulator (requires root). Ordinary test/check never contacts a device.
+tasks.register<JavaExec>("probeMemory") {
+    group = "verification"
+    dependsOn(probe.classesTaskName)
+    classpath = probe.runtimeClasspath
+    mainClass.set("com.landosol.toolbox.desktop.device.LiveMemoryProbeKt")
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+    systemProperty("stderr.encoding", "UTF-8")
+    args(providers.gradleProperty("probeAdb").orElse("").get(), providers.gradleProperty("probeSerial").orElse("").get(),
+        providers.gradleProperty("probeOutput").orElse("").get(),
+        providers.gradleProperty("probeGame").orElse("com.bilibili.priconne").get(),
+        providers.gradleProperty("probeSeconds").orElse("30").get())
+}
