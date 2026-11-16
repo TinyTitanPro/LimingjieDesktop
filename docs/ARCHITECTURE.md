@@ -55,7 +55,7 @@
 | [wbero/limingjie-assistant](https://github.com/wbero/limingjie-assistant) | 共享业务基线（识别、协议、迷宫流程、数据库） | 初始移植基线，通过替身与派生复用，不在桌面层复制分叉 |
 | [SatenRuiko10032/limingjie-assistant](https://github.com/SatenRuiko10032/limingjie-assistant) | 十公会阵容与新增公会修正 | 选择性同步，目标提交由 `upstream-drift.properties` SHA 锁约束 |
 | [cc004/autopcr](https://github.com/cc004/autopcr) 及本机 Android 参考 | 登录、协议与迷宫行为的可观察输入/输出/错误语义 | 不包含 Python、Chaquopy 或 AutoPCR HTTP 服务 |
-| 项目所有者的可可萝自动会战助手（PC 版探针脚本） | 内存探针领域逻辑、Il2Cpp 字段偏移与稳定性铁律 | 自有领域逻辑可迁移；只读探针，不写内存 |
+| [wbero/kokkoro-clan-battle-assistant](https://github.com/wbero/kokkoro-clan-battle-assistant)（可可萝公会战自动助手，含 PC 版 Frida 只读内存探针） | 探针领域逻辑、Il2Cpp 字段偏移校准、ART 线程包装等稳定性实践 | 上游原作者自有领域逻辑可迁移；本机探针脚本副本不纳入 Git；实现只读不写内存 |
 | [Ice9Coffee/LandosolRoster](https://github.com/Ice9Coffee/LandosolRoster) | 角色 ID、名称、别名与可用性 | GPL-3.0 来源声明保留，不推断评分/职能 |
 | [国服数据库](https://github.com/SonderXiaoming/priconne-database) | 核对主键、技能和正式名称 | 完整数据库不打包进 APK，离线导入保持可重复 |
 | [frida/frida](https://github.com/frida/frida) | `frida-inject` 17.16.4（android-x86_64） | 注入只读探针脚本；二进制按 SHA-256 锁校验 |
@@ -67,7 +67,7 @@
 
 ### 背景
 
-原有页面状态判定完全依赖截图 + 模板匹配/OCR。在主页、地图、战斗中等高频页面，整帧匹配是可避免的开销。参考 `labyrinth-auto-release` APK 的 Frida 注入方案，其核心探针源自项目所有者本人的 PC 版脚本，属于可迁移的自有领域逻辑，故在桌面端实现只读内存探针作为状态判定的快路径。
+原有页面状态判定完全依赖截图 + 模板匹配/OCR。在主页、地图、战斗中等高频页面，整帧匹配是可避免的开销。参考 `labyrinth-auto-release` APK 的 Frida 注入方案，其核心探针（`perception_probe.js`）源自上游原作者 wbero 的另一套自动化项目——可可萝公会战自动助手（[kokkoro-clan-battle-assistant](https://github.com/wbero/kokkoro-clan-battle-assistant)）中的 PC 版 Frida 只读探针脚本。该脚本通过注入游戏进程、直接读取 Il2Cpp 运行时的 UI 状态（当前视图类名、ViewId、活动弹窗等）判定页面，减少对截图识别的依赖；本机保留的脚本副本仅作参考、不纳入 Git。上述探针逻辑属于可迁移的上游自有领域逻辑，故在桌面端重新实现为只读内存探针，作为状态判定的快路径。
 
 ### 设计原则
 
